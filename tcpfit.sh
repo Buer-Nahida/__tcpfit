@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-VERSION="0.3.4"
+VERSION="0.3.5"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -280,7 +280,7 @@ calc_tcp_mem(){
 #
 # 原先是死写的 [4MB, 64MB]. 64MB 这个数在两头都错：
 #   高带宽机被无谓截断 —— 2G/149ms 的机器 2×BDP 是 71MB, 被砍成 64MB,
-#   接收窗口只剩 32MB, 单流上限 1.93Gbps, 刚好够不到 2G（实测验证, 见 FINDINGS 14）.
+#   接收窗口只剩 32MB, 单流上限 1.93Gbps, 刚好够不到 2G.
 #   小内存机又太松 —— 1GB 的机器也允许单个 socket 占 64MB, 几条大流就吃光 tcp_mem.
 #
 # 改成跟 tcp_mem 挂钩：单个 socket 最多占全局 TCP 预算的 1/8, 即至少要能容下
@@ -357,6 +357,44 @@ calc_buf_default(){
   esac
 }
 
+# 调优会动到的全部内核参数. 快照和回滚都以这份清单为准 ——
+# 早期版本快照只记了 14 项而 tune 设了 31 项, 回滚后有 17 项在重启前仍是调优值.
+# 加参数时必须同时加到这里, 否则那个参数就回滚不掉.
+TUNED_KEYS="
+  net.core.default_qdisc
+  net.ipv4.tcp_congestion_control
+  net.core.rmem_max
+  net.core.wmem_max
+  net.core.rmem_default
+  net.core.wmem_default
+  net.ipv4.tcp_rmem
+  net.ipv4.tcp_wmem
+  net.ipv4.tcp_mem
+  net.ipv4.tcp_window_scaling
+  net.ipv4.tcp_moderate_rcvbuf
+  net.ipv4.tcp_adv_win_scale
+  net.core.netdev_max_backlog
+  net.core.netdev_budget
+  net.core.netdev_budget_usecs
+  net.core.optmem_max
+  net.core.somaxconn
+  net.ipv4.tcp_max_syn_backlog
+  net.ipv4.tcp_slow_start_after_idle
+  net.ipv4.tcp_no_metrics_save
+  net.ipv4.tcp_mtu_probing
+  net.ipv4.tcp_sack
+  net.ipv4.tcp_dsack
+  net.ipv4.tcp_timestamps
+  net.ipv4.tcp_fastopen
+  net.ipv4.tcp_syncookies
+  net.ipv4.tcp_tw_reuse
+  net.ipv4.tcp_fin_timeout
+  net.ipv4.tcp_keepalive_time
+  net.ipv4.ip_local_port_range
+  vm.min_free_kbytes
+  vm.swappiness
+"
+
 # ── 快照与回滚 ──────────────────────────────────────────────────────────────
 take_snapshot(){
   mkdir -p "$STATE_DIR"
@@ -376,11 +414,7 @@ take_snapshot(){
   {
     echo "# tcpfit pre-tune snapshot  $(date -u +%FT%TZ)"
     echo "KERNEL=$(uname -r)"
-    for k in net.ipv4.tcp_congestion_control net.core.default_qdisc \
-             net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem \
-             net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default \
-             net.core.netdev_max_backlog net.core.somaxconn net.ipv4.tcp_adv_win_scale \
-             net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_mtu_probing; do
+    for k in $TUNED_KEYS; do
       printf '%s = %s\n' "$k" "$(sysctl -n "$k" 2>/dev/null)"
     done
     echo "# route: $(ip route show default)"
@@ -392,8 +426,15 @@ take_snapshot(){
 cmd_rollback(){
   need_root
   migrate_legacy
+  local purge_swap=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge-swap) purge_swap=1; shift ;;
+      *) die "未知参数: $1" ;;
+    esac
+  done
   info "回滚中…"
-  rm -f "$SYSCTL_FILE" "$ROUTE_HOOK"
+  rm -f "$SYSCTL_FILE" "$ROUTE_HOOK" /etc/modules-load.d/tcpfit-bbr.conf
   systemctl disable --now tcpfit-qdisc.service >/dev/null 2>&1
   rm -f "$QDISC_UNIT" "$QDISC_SCRIPT"
   systemctl daemon-reload >/dev/null 2>&1
@@ -403,13 +444,27 @@ cmd_rollback(){
   [ -n "$gw" ] && ip route replace default via "$gw" dev "$iface" 2>/dev/null
   # 逐项写回快照值
   if [ -f "$SNAPSHOT" ]; then
-    grep -E '^net\.' "$SNAPSHOT" | while IFS='=' read -r k v; do
+    grep -E '^(net|vm|fs)\.' "$SNAPSHOT" | while IFS='=' read -r k v; do
       k=$(echo "$k" | xargs); v=$(echo "$v" | xargs)
       [ -n "$k" ] && [ -n "$v" ] && sysctl -qw "$k=$v" 2>/dev/null
     done
     ok "已按快照还原 sysctl"
   else
     warn "找不到快照, 仅移除了调优文件；重启后内核默认值生效"
+  fi
+  # swap 默认不动 —— 删掉一个正在用的 swap 可能让机器立刻 OOM.
+  # 想连 swap 一起撤销要显式加 --purge-swap.
+  if [ "$purge_swap" = 1 ]; then
+    if [ -f /swapfile ]; then
+      swapoff /swapfile 2>/dev/null
+      rm -f /swapfile
+      sed -i '\#^/swapfile #d' /etc/fstab
+      ok "已移除 /swapfile 及其 fstab 条目"
+    else
+      info "没有 /swapfile, 跳过"
+    fi
+  elif [ -f /swapfile ]; then
+    info "/swapfile 保留. 要一并删除: $(disp) rollback --purge-swap"
   fi
   ok "回滚完成"
 }
@@ -476,7 +531,7 @@ cmd_tune(){
   cat > "$SYSCTL_FILE" <<EOF
 # 由 tcpfit v$VERSION 生成  $(date -u +%FT%TZ)
 # 带宽=${bw}Mbps  RTT=${rtt}ms  内存=${ram}MB  角色=${role}
-# 每个值的依据见 docs/FINDINGS.md, 勿手改；改用 tcpfit tune 重新生成
+# 勿手改；要改用 tcpfit tune 重新生成
 
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = $cc
@@ -519,7 +574,7 @@ net.ipv4.ip_local_port_range = 1024 65535
 vm.min_free_kbytes = 32768
 fs.file-max = 1000000
 
-# 刻意不设的项（见 FINDINGS.md）:
+# 刻意不设的项:
 #   tcp_notsent_lowat  —— 低核数机器上压吞吐
 #   tcp_reordering=300 —— 现代内核走 RACK, 调高只推迟快速重传
 EOF
@@ -1019,13 +1074,26 @@ cmd_update(){
   echo
   confirm "  现在更新？" y || { info "已取消"; return 0; }
 
-  local tmp="$SELF_PATH.tmp"
-  curl -fsSL --max-time 60 "https://raw.githubusercontent.com/Kylin010/tcpfit/v$latest/tcpfit.sh" -o "$tmp" \
-    || die "下载失败" 2
-  if ! { head -1 "$tmp" | grep -q '^#!' && grep -q "^VERSION=\"$latest\"" "$tmp"; }; then
-    rm -f "$tmp"; die "下载的文件校验不通过, 未更新" 2
+  # 从 release 下, 用发布的 SHA256SUMS 校验. 只对比 tcpfit.sh 那一行 ——
+  # SHA256SUMS 里还有 install.sh, 直接 sha256sum -c 会因为文件不在而失败.
+  local dl; dl=$(mktemp -d)
+  local base="https://github.com/Kylin010/tcpfit/releases/download/v$latest"
+  if ! curl -fsSL --max-time 60 "$base/tcpfit.sh" -o "$dl/tcpfit.sh"; then
+    rm -rf "$dl"; die "下载失败" 2
   fi
-  mv "$tmp" "$SELF_PATH"; chmod +x "$SELF_PATH"
+  if command -v sha256sum >/dev/null && curl -fsSL --max-time 20 "$base/SHA256SUMS" -o "$dl/SHA256SUMS"; then
+    if ! ( cd "$dl" && grep ' tcpfit\.sh$' SHA256SUMS | sha256sum -c - >/dev/null 2>&1 ); then
+      rm -rf "$dl"; die "SHA256 校验不通过, 未更新" 2
+    fi
+    info "SHA256 校验通过"
+  else
+    warn "取不到 SHA256SUMS 或没有 sha256sum, 退回版本号校验"
+  fi
+  if ! { head -1 "$dl/tcpfit.sh" | grep -q '^#!' && grep -q "^VERSION=\"$latest\"" "$dl/tcpfit.sh"; }; then
+    rm -rf "$dl"; die "下载的文件校验不通过, 未更新" 2
+  fi
+  install -m 755 "$dl/tcpfit.sh" "$SELF_PATH"
+  rm -rf "$dl"
   ok "已更新到 v$latest"
   info "配置和快照不受影响. 想让新版参数生效, 重跑一次调优."
 }

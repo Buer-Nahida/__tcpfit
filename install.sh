@@ -111,4 +111,4 @@ echo "    cd $PROJECT_DIR"
 echo "    python3 orchestrator/fleet.py detect --dry-run   # 先确认命令拼对"
 echo "    python3 orchestrator/fleet.py detect"
 echo
-echo "读一遍 docs/FINDINGS.md 再动手, 那里有每条参数的实测依据."
+echo "先跑 tcpfit detect 看机器画像, 再决定参数."

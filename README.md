@@ -13,7 +13,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 固定版本并校验:
 
 ```bash
-V=v0.3.4
+V=v0.3.5
 curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/tcpfit.sh
 curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS
@@ -106,11 +106,14 @@ python3 orchestrator/fleet.py verify
 ## 回滚
 
 ```bash
-tcpfit rollback       # 按快照逐项写回, 不是恢复默认
+tcpfit rollback                # 按快照逐项写回, 不是恢复默认
+tcpfit rollback --purge-swap   # 同时删掉 harden 建的 /swapfile
 tcpfit shape --off    # 只去掉整形
 ```
 
-首次改动前自动存快照到 `/var/lib/tcpfit/pre-tune.snapshot`.
+首次改动前自动存快照到 `/var/lib/tcpfit/pre-tune.snapshot`, 记录全部 32 项参数的原始值.
+
+swap 默认不动 —— 删掉正在用的 swap 可能让机器立刻 OOM, 要一并撤销得显式加 `--purge-swap`.
 
 改动只落在这些文件, 不碰 `/etc/sysctl.conf`:
 
