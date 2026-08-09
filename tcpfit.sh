@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.4.1"
+VERSION="0.4.2"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -82,6 +82,7 @@ take_lock(){
   local pids age
   # 排除自己 —— 上面已经 exec 9> 打开了锁文件, 不排掉会把自己也列成持有者
   pids=$(fuser "$LOCK_FILE" 2>/dev/null | tr -s ' ' | tr ' ' '\n' | grep -vx "$$" | grep -x '[0-9]*' | tr '\n' ' ')
+  [ -n "$pids" ] || pids=$(command -v lsof >/dev/null && lsof -t "$LOCK_FILE" 2>/dev/null | grep -vx "$$" | tr '\n' ' ')
   warn "另一个 tcpfit 正在运行（锁: $LOCK_FILE）"
   if [ -n "$pids" ]; then
     echo "      持有者:"
@@ -92,11 +93,18 @@ take_lock(){
   fi
   echo "      跑得太久多半是上次异常退出卡住了."
   echo
+  # 拿不到 PID 就没法安全地只杀它们, 不如让用户自己处理
+  [ -n "$pids" ] || die "查不到锁的持有者, 手动检查: fuser -v $LOCK_FILE"
   if confirm "  结束它并继续？" n; then
     exec 9>&-                                   # 先松开自己, 否则会把自己一起杀掉
-    fuser -k -TERM "$LOCK_FILE" >/dev/null 2>&1  # 先 TERM, 让对方的 trap 有机会恢复 qdisc
+    # 只杀最初记录的那几个 PID. 绝不能第二次去查锁文件 ——
+    # 旧实例收到 TERM 退出后, 别的新实例可能在这 3 秒里拿到锁,
+    # 再查一次就会把那个无辜的新实例 KILL 掉(实测复现过, 新实例退出码 137).
+    kill -TERM $pids 2>/dev/null            # 先 TERM, 让对方的 trap 有机会恢复 qdisc
     sleep 3
-    fuser -k -KILL "$LOCK_FILE" >/dev/null 2>&1
+    for _p in $pids; do
+      kill -0 "$_p" 2>/dev/null && kill -KILL "$_p" 2>/dev/null
+    done
     sleep 1
     reap_iperf
     exec 9>"$LOCK_FILE" || return 0
@@ -848,8 +856,10 @@ qdisc_save(){   # qdisc_save <iface>
 # 不支持就退回到能用的写法, 而不是让每次调用都报错.
 TIMEOUT_FG=""
 timeout --foreground 1 true >/dev/null 2>&1 && TIMEOUT_FG="--foreground"
-PKILL_G=1
-pkill -g 999999 -x __tcpfit_probe__ >/dev/null 2>&1 || [ $? -le 1 ] || PKILL_G=0
+# 不能靠"跑一次看退出码"判断: BusyBox 不认 -g 时也返回 1, 会被误判成支持.
+# 改看帮助里有没有长选项 --pgroup —— BusyBox 压根不支持长选项.
+PKILL_G=0
+pkill --help 2>&1 | grep -q -- '--pgroup' && PKILL_G=1
 
 # 收掉本脚本起的 iperf3. 优先按进程组匹配 —— iperf3 的父进程是 timeout 不是本脚本,
 # 按 -P $$ 匹配不到. 只杀同组的, 不动用户手工跑的.
@@ -1854,6 +1864,7 @@ wizard(){
 
   printf '\n  %s[4/5] Apply shaping%s\n' "$bold" "$plain"
   if [ -n "$rate" ]; then cmd_shape --rate "$rate"
+  elif [ -n "$out_of_range" ]; then info "policer present but knee not located in range, shaping skipped"
   elif [ -n "$no_knee" ]; then info "no policer detected, shaping intentionally skipped"
   else warn "no knee measured, shaping skipped"; fi
 
