@@ -13,7 +13,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 固定版本并校验:
 
 ```bash
-V=v0.3.3
+V=v0.3.4
 curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/tcpfit.sh
 curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/SHA256SUMS
 sha256sum -c SHA256SUMS
@@ -39,7 +39,11 @@ bash tcpfit.sh
    5. 查看状态   Status
    6. 端口验证   Verify port capability    ~1 min
    7. 回滚改动   Rollback all changes
+   8. 检查更新   Check for updates
 ```
+
+脚本不会自动更新. 装好之后跑的一直是装的那一版, 想升级用菜单 8 或 `tcpfit update` ——
+它只检查, 发现新版本会问你要不要更新.
 
 一键调优只问三个问题: 带宽、测速对端、机器用途. 确认之后跑到底不再打断.
 
@@ -65,6 +69,7 @@ tcpfit harden   --swap 2G                         # 加 swap
 tcpfit verify   --peer <近处iperf3服务器>          # 测速验证
 tcpfit status                                     # 当前配置
 tcpfit rollback                                   # 回滚全部改动
+tcpfit update                                     # 检查更新
 ```
 
 ## 多机

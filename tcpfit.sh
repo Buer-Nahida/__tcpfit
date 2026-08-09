@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-VERSION="0.3.3"
+VERSION="0.3.4"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -995,6 +995,41 @@ cmd_verify(){
   rule
 }
 
+# ── 检查更新 ────────────────────────────────────────────────────────────────
+cmd_update(){
+  need_root
+  command -v curl >/dev/null || die "需要 curl"
+  info "检查更新…"
+  local latest
+  # 只看 release, 不看 main —— main 可能领先于任何已发布版本
+  latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/Kylin010/tcpfit/releases/latest" 2>/dev/null \
+           | grep -m1 '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/')
+  [ -n "$latest" ] || die "查不到最新版本, 检查网络或稍后再试" 2
+
+  if [ "$latest" = "$VERSION" ]; then ok "已是最新版本 v$VERSION"; return 0; fi
+  # 用 sort -V 比版本号, 字符串比较会把 0.3.10 判成小于 0.3.9
+  if [ "$(printf '%s\n%s\n' "$VERSION" "$latest" | sort -V | tail -1)" = "$VERSION" ]; then
+    ok "当前 v$VERSION 比已发布的 v$latest 还新（开发版）"; return 0
+  fi
+
+  echo
+  _conf "当前版本" "v$VERSION"
+  _conf "最新版本" "v$latest"
+  _conf "更新说明" "https://github.com/Kylin010/tcpfit/releases/tag/v$latest"
+  echo
+  confirm "  现在更新？" y || { info "已取消"; return 0; }
+
+  local tmp="$SELF_PATH.tmp"
+  curl -fsSL --max-time 60 "https://raw.githubusercontent.com/Kylin010/tcpfit/v$latest/tcpfit.sh" -o "$tmp" \
+    || die "下载失败" 2
+  if ! { head -1 "$tmp" | grep -q '^#!' && grep -q "^VERSION=\"$latest\"" "$tmp"; }; then
+    rm -f "$tmp"; die "下载的文件校验不通过, 未更新" 2
+  fi
+  mv "$tmp" "$SELF_PATH"; chmod +x "$SELF_PATH"
+  ok "已更新到 v$latest"
+  info "配置和快照不受影响. 想让新版参数生效, 重跑一次调优."
+}
+
 # ── 交互式菜单 ──────────────────────────────────────────────────────────────
 #
 # 设计原则：用户只需要回答"这机器干什么用的", 其余全部自动.
@@ -1199,6 +1234,7 @@ banner(){
   _item 5 "查看状态" "Status"
   _item 6 "端口验证" "Verify port capability"    "~1 min"
   _item 7 "回滚改动" "Rollback all changes"
+  _item 8 "检查更新" "Check for updates"
   _bot
   printf "  %-9s %s core / %s MB / %s\n" "Machine" "$cores" "$ram" "$(uname -r)"
   printf "  %-9s cc=%s  shaper=%s  " "Network" "${cc:-?}" "${shaper:-none}"
@@ -1464,7 +1500,7 @@ menu_loop(){
   while true; do
     banner
     echo
-    local c; c=$(ask "  请选择 / Select [0-7]" "1")
+    local c; c=$(ask "  请选择 / Select [0-8]" "1")
     echo
     case "$c" in
       1) wizard ;;
@@ -1493,6 +1529,7 @@ menu_loop(){
       5) cmd_status ;;
       6) local p; if p=$(auto_pick_peer); then PEER_PORT="${p##*:}"; cmd_verify --peer "${p%:*}"; else cmd_verify; fi ;;
       7) confirm "  确定回滚全部改动？" && cmd_rollback ;;
+      8) cmd_update ;;
       0) exit 0 ;;
       *) warn "Invalid selection" ;;
     esac
@@ -1516,6 +1553,7 @@ case "${1:-}" in
   verify)   shift; cmd_verify "$@" ;;
   status)   shift; cmd_status "$@" ;;
   rollback) shift; cmd_rollback "$@" ;;
+  update)   shift; cmd_update "$@" ;;
   version)  echo "tcpfit $VERSION" ;;
   menu)     shift; menu_loop ;;
   "")       menu_loop ;;
