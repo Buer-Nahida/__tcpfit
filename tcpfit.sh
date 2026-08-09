@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.4.2"
+VERSION="0.4.3"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -1740,13 +1740,27 @@ wizard(){
   printf "       %s本脚本默认连 5201 端口%s；对端换了端口的话填  IP:端口  形式. \n" "$yellow" "$plain"
   echo "       对端要选离本机近的."
   echo
-  peer=$(ask "  对端 IP / 域名（回车=公共节点）" "")
-  if [ -z "$peer" ]; then
-    local picked; picked=$(auto_pick_peer) || die "公共测速服务器暂时都不可用, 稍后再试" 2
-    peer="${picked%:*}"; PEER_PORT="${picked##*:}"
-  else
+  while true; do
+    peer=$(ask "  对端 IP / 域名（回车=公共节点）" "")
+    if [ -z "$peer" ]; then
+      local picked; picked=$(auto_pick_peer) || die "公共测速服务器暂时都不可用, 稍后再试" 2
+      peer="${picked%:*}"; PEER_PORT="${picked##*:}"
+      break
+    fi
+    PEER_PORT=5201
     case "$peer" in *:*) PEER_PORT="${peer##*:}"; peer="${peer%:*}" ;; esac
-  fi
+    # 手填的对端当场验一次可达性. 打错 IP 的话不该等到执行阶段才发现 ——
+    # 那时前面三个问题都白填了, 而且已经改过 sysctl.
+    printf '    检查 %s:%s … ' "$peer" "$PEER_PORT" >&2
+    if timeout 6 bash -c "cat < /dev/null > /dev/tcp/${peer}/${PEER_PORT}" 2>/dev/null; then
+      printf '%s\n' "$(_c '0;32' '可达')" >&2
+      break
+    fi
+    printf '%s\n' "$(_c '0;31' '连不上')" >&2
+    echo "      常见原因: 对端没在跑 iperf3 -s / 端口填错 / 防火墙挡了 / IP 打错"
+    echo "      回车可以改用公共节点."
+    echo
+  done
   fi
 
   # ── 3/3 用途 ────────────────────────────────────────────────────────────
