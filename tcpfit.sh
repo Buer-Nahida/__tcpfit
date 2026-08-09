@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.3.10"
+VERSION="0.4.0"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -813,9 +813,23 @@ qdisc_save(){   # qdisc_save <iface>
   QSAVE_KIND=$(tc qdisc show dev "$1" 2>/dev/null | awk '$1=="qdisc"{print $2; exit}')
 }
 # 把本脚本起的 iperf3 全部收掉. 只杀自己的子进程, 不动用户手工跑的.
-# 收掉本脚本起的 iperf3. 用进程组匹配 —— iperf3 的父进程是 timeout 不是本脚本,
+# BusyBox(Alpine) 的 timeout 没有 --foreground, pkill 没有 -g. 启动时探一次,
+# 不支持就退回到能用的写法, 而不是让每次调用都报错.
+TIMEOUT_FG=""
+timeout --foreground 1 true >/dev/null 2>&1 && TIMEOUT_FG="--foreground"
+PKILL_G=1
+pkill -g 999999 -x __tcpfit_probe__ >/dev/null 2>&1 || [ $? -le 1 ] || PKILL_G=0
+
+# 收掉本脚本起的 iperf3. 优先按进程组匹配 —— iperf3 的父进程是 timeout 不是本脚本,
 # 按 -P $$ 匹配不到. 只杀同组的, 不动用户手工跑的.
-reap_iperf(){ pkill -g $$ -x iperf3 2>/dev/null; pkill -g $$ -x timeout 2>/dev/null; return 0; }
+reap_iperf(){
+  if [ "$PKILL_G" = 1 ]; then
+    pkill -g $$ -x iperf3 2>/dev/null; pkill -g $$ -x timeout 2>/dev/null
+  else
+    pkill -P $$ -x iperf3 2>/dev/null; pkill -P $$ -x timeout 2>/dev/null
+  fi
+  return 0
+}
 
 qdisc_restore(){
   reap_iperf
@@ -901,7 +915,7 @@ run_iperf(){
   tmp=$(mktemp)
   for port in $ports; do
     : > "$tmp"
-    timeout --foreground $(( $2 + 25 )) iperf3 -c "$1" -p "$port" -t "$2" -P "$3" -f m >"$tmp" 2>&1 &
+    timeout $TIMEOUT_FG $(( $2 + 25 )) iperf3 -c "$1" -p "$port" -t "$2" -P "$3" -f m >"$tmp" 2>&1 &
     pid=$!
     # --foreground 是必须的: timeout 默认把子进程放进【独立进程组】(方便超时时杀整组),
     # 结果 Ctrl-C 发给脚本进程组的 SIGINT 根本到不了 iperf3, 它会继续满速跑到
@@ -982,8 +996,12 @@ cmd_sweep(){
     [ -n "$nominal" ] || nominal="$hi"
     [ -n "$step" ] || step=$(calc_step "$nominal")
   fi
-  qdisc_guard "$iface" || { info "已取消"; return 0; }
   is_posint "$cap" 100 100000 || die "--cap 必须是 100-100000 的整数"
+  # 校验一过就清掉上一轮的结果, 必须在任何 return 之前 ——
+  # 否则这轮失败(对端太慢/探测失败/取消)时, 向导和菜单会读到上次的 RECOMMEND
+  # 并把旧限速值应用上去, 而屏幕上写的是 "shaping skipped".
+  mkdir -p "$STATE_DIR"; rm -f "$STATE_DIR/sweep.result"
+  qdisc_guard "$iface" || { info "已取消"; return 0; }
 
   [ "$WIZARD" = 1 ] || traffic_mark
   info "Peer ${peer}:${PEER_PORT}"
@@ -1430,7 +1448,7 @@ auto_pick_peer(){
     printf '  %-34s %-10s %-10s RTT %-6s ' "$cand" "$name" "$prov" "${rtt}ms" >&2
     # 先探端口, 把"根本不跑 iperf3/被墙"和"跑着但占线"分开 ——
     # 早期两者都报"占线", 用户完全看不出真实原因
-    if ! timeout --foreground 6 bash -c "cat < /dev/null > /dev/tcp/$cand/5201" 2>/dev/null; then
+    if ! timeout $TIMEOUT_FG 6 bash -c "cat < /dev/null > /dev/tcp/$cand/5201" 2>/dev/null; then
       echo "port closed" >&2; continue
     fi
     # 没装 iperf3 时无法做占线探测（iperf3 要等确认之后才装）,
@@ -1443,7 +1461,7 @@ auto_pick_peer(){
     # 早期只试 5201, 等于放着 9 个空闲实例不用去跟全世界抢一个, 动不动就"占线".
     local gp="" try
     for try in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210; do
-      if timeout --foreground 25 iperf3 -c "$cand" -p "$try" -t 3 -P 1 >/dev/null 2>&1; then gp="$try"; break; fi
+      if timeout $TIMEOUT_FG 25 iperf3 -c "$cand" -p "$try" -t 3 -P 1 >/dev/null 2>&1; then gp="$try"; break; fi
     done
     if [ -n "$gp" ]; then
       if [ "$rtt" -le "$ideal" ] 2>/dev/null; then
@@ -1602,7 +1620,8 @@ wizard(){
       if   command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y iperf3
       elif command -v dnf     >/dev/null; then dnf install -y iperf3
       elif command -v yum     >/dev/null; then yum install -y epel-release; yum install -y iperf3
-      elif command -v apk     >/dev/null; then apk add iperf3
+      # Alpine 的 busybox timeout/pkill 功能不全, 一并装 GNU 版
+      elif command -v apk     >/dev/null; then apk add iperf3 coreutils procps
       else warn "认不出包管理器, 请手动安装 iperf3"; fi
       echo "    ────────────────────────────────────────"
     fi
@@ -1787,10 +1806,16 @@ wizard(){
   esac
 
   printf '\n  %s[3/5] Policer sweep%s\n' "$bold" "$plain"
-  cmd_sweep --peer "$peer" --nominal "$bw" || warn "sweep did not produce a knee, shaping skipped"
+  local sweep_rc=0
+  cmd_sweep --peer "$peer" --nominal "$bw" || sweep_rc=$?
+  # rc=3 是"扫完了但没有可用拐点"(没限速器/超上限/超范围), 结果文件是这轮写的, 可以读.
+  # 其他非 0 是这轮压根没跑成, 结果文件已被清空, 不要去读.
+  [ "$sweep_rc" = 0 ] || [ "$sweep_rc" = 3 ] || warn "sweep failed, shaping skipped"
 
-  if [ -f "$STATE_DIR/sweep.result" ]; then
+  local out_of_range=""
+  if { [ "$sweep_rc" = 0 ] || [ "$sweep_rc" = 3 ]; } && [ -f "$STATE_DIR/sweep.result" ]; then
     no_knee=$(awk -F= '/^NO_KNEE/{print $2}' "$STATE_DIR/sweep.result")
+    out_of_range=$(awk -F= '/^OUT_OF_RANGE/{print $2}' "$STATE_DIR/sweep.result")
     knee=$(awk -F= '/^KNEE/{print $2}'      "$STATE_DIR/sweep.result")
     rate=$(awk -F= '/^RECOMMEND/{print $2}' "$STATE_DIR/sweep.result")
     [ -n "$knee" ] && [ -n "$rate" ] && margin=$(( knee - rate ))
@@ -1804,12 +1829,12 @@ wizard(){
   printf '\n  %s[5/5] Verify%s\n' "$bold" "$plain"
   command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
 
-  wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "$no_knee"
+  wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "$no_knee" "$out_of_range"
 }
 
 # 结果段落. 正常流程和"手动指定整形值"两条路径共用, 避免两份重复的排版代码.
 wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内存MB> [无拐点]
-  local bw="${1:-}" rate="${2:-}" knee="${3:-}" margin="${4:-}" ram="${5:-0}" no_knee="${6:-}"
+  local bw="${1:-}" rate="${2:-}" knee="${3:-}" margin="${4:-}" ram="${5:-0}" no_knee="${6:-}" oor="${7:-}"
   printf '\n  %s════ 结果 ══════════════════════════════════════════════%s\n' "$bold" "$plain"
   echo
   if [ -n "$knee" ]; then
@@ -1819,6 +1844,10 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
     echo
   elif [ -n "$rate" ]; then
     _conf "已应用整形"   "${rate} Mbit"
+    echo
+  elif [ -n "$oor" ]; then
+    _conf "整形"         "未设置"
+    _conf "原因"         "检测到限速迹象, 但未在扫描范围内定位到拐点"
     echo
   elif [ -n "$no_knee" ]; then
     _conf "整形"         "未设置"

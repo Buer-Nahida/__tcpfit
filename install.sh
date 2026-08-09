@@ -52,7 +52,7 @@ if [ "$MODE" = agent ]; then
     if   command -v apt-get >/dev/null; then echo "    apt-get install -y iperf3"
     elif command -v dnf     >/dev/null; then echo "    dnf install -y iperf3"
     elif command -v yum     >/dev/null; then echo "    yum install -y epel-release && yum install -y iperf3"
-    elif command -v apk     >/dev/null; then echo "    apk add iperf3"
+    elif command -v apk     >/dev/null; then echo "    apk add iperf3 coreutils procps"
     else echo "    用你的包管理器装 iperf3"; fi
   fi
 
