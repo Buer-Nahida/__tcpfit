@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.3.6"
+VERSION="0.3.7"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -678,7 +678,7 @@ cmd_harden(){
   # 允许只写数字, 按 GB 算 —— 菜单里让用户输 1-20 的数字
   # 只收纯数字, 按 GB 算. 早期允许 "2M" 这类写法, 但 fallocate 建 2MB 而
   # 失败回退的 dd 建 2GB, 两条路差 1000 倍.
-  is_posint "$swap_size" 1 20 || die "swap 大小请填 1-20 之间的整数（单位 GB）, 收到: $swap_size"
+  is_posint "$swap_size" 1 20 || die "swap 大小请填 1-20 之间的整数（单位 GB）"
   local gb="$swap_size"; swap_size="${gb}G"
 
   if swapon --show 2>/dev/null | grep -q .; then
@@ -766,7 +766,7 @@ cmd_shape(){
 
   [ -n "$rate" ] || die "需要 --rate <Mbit>, 或用 --off 移除整形"
   # 校验必须在 take_snapshot 之前 —— 否则打错一个字就会留下快照和半截 qdisc
-  is_posint "$rate" 1 100000 || die "--rate 必须是 1-100000 的整数（Mbit）, 收到: $rate"
+  is_posint "$rate" 1 100000 || die "--rate 必须是 1-100000 的整数（Mbit）"
   take_snapshot
   write_qdisc "$rate" "$iface"
   systemctl restart tcpfit-qdisc.service 2>/dev/null || "$QDISC_SCRIPT" "$rate"
@@ -781,6 +781,24 @@ cmd_shape(){
     && ok "tcpfit-qdisc.service enabled (survives reboot)" \
     || warn "tcpfit-qdisc.service not enabled -- shaping will be lost on reboot"
   [ "$WIZARD" = 1 ] || tc class show dev "$iface"
+}
+
+# 测试期间的临时整形. 结构必须和 write_qdisc 生成的完全一致.
+#
+# 两个原因:
+#   1) fq 的 maxrate 是【每条流】的上限, 不是聚合上限. 实测: fq maxrate 300mbit
+#      跑 -P 1 得 283 Mbps, 跑 -P 4 得 1134 Mbps(约 4 倍). 只有 HTB 才是聚合限速.
+#      早期版本用 fq maxrate 做限速, 于是 validate_peer(跑 -P 2)名义上限 40%
+#      实际能冲到 80%, 可能撞上限速器再把丢包报成"链路本身有损".
+#   2) 扫描用一种结构、最终应用另一种结构的话, 测出来的拐点对不上实际部署.
+apply_test_shaper(){   # apply_test_shaper <iface> <rate_mbit>
+  local iface="$1" rate="$2"
+  tc qdisc del dev "$iface" root 2>/dev/null
+  tc qdisc add dev "$iface" root handle 1: htb default 10 2>/dev/null || return 1
+  tc class add dev "$iface" parent 1: classid 1:10 htb \
+     rate "${rate}mbit" ceil "${rate}mbit" burst 32k cburst 32k quantum 1514 2>/dev/null || return 1
+  tc qdisc add dev "$iface" parent 1:10 handle 10: fq \
+     limit 40960 flow_limit 8192 maxrate "${rate}mbit" 2>/dev/null || return 1
 }
 
 # ── 测试用 qdisc 的保存与恢复 ────────────────────────────────────────────────
@@ -812,7 +830,7 @@ qdisc_guard(){   # qdisc_guard <iface>
     ""|mq|fq|noqueue|pfifo_fast|fq_codel|htb) return 0 ;;
   esac
   warn "本机根 qdisc 是 ${k}, 测试期间会被临时替换."
-  warn "结束时只能恢复成 ${k} 的默认参数, 你原来的细节配置会丢."
+  warn "结束时只能恢复成 ${k} 的默认参数, 自己的调优配置会丢失."
   confirm "  继续？" || return 1
 }
 
@@ -909,7 +927,7 @@ cmd_sweep(){
   take_lock
   command -v iperf3 >/dev/null || die "需要 iperf3: apt install -y iperf3 / yum install -y iperf3"
   # GAP: 档与档之间的静置时间, 让上一条流的状态排空, 避免相邻两档互相干扰
-  local peer="" nominal="" lo="" hi="" step="" dur=12 par=1 margin="" thresh=0.1 refine=1 GAP=3
+  local peer="" nominal="" lo="" hi="" step="" dur=12 par=1 margin="" thresh=0.1 refine=1 GAP=3 cap=2500
   while [ $# -gt 0 ]; do
     case "$1" in
       --peer) peer="$2"; shift 2 ;;
@@ -922,6 +940,7 @@ cmd_sweep(){
       --parallel) par="$2"; shift 2 ;;
       --margin) margin="$2"; shift 2 ;;
       --gap) GAP="$2"; shift 2 ;;
+      --cap) cap="$2"; shift 2 ;;
       --no-refine) refine=0; shift ;;
       --loss-threshold|--retrans-threshold) thresh="$2"; shift 2 ;;   # 单位是百分比
       *) die "未知参数: $1" ;;
@@ -931,23 +950,23 @@ cmd_sweep(){
             "par:$par:1:128" "lo:$lo:1:1000000" "hi:$hi:1:1000000" "gap:$GAP:0:60"; do
     _n=${_v%%:*}; _r=${_v#*:}; _val=${_r%%:*}; _r=${_r#*:}; _min=${_r%%:*}; _max=${_r#*:}
     [ -z "$_val" ] && continue
-    is_posint "$_val" "$_min" "$_max" || die "--${_n} 必须是 ${_min}-${_max} 的整数, 收到: $_val"
+    is_posint "$_val" "$_min" "$_max" || die "--${_n} 必须是 ${_min}-${_max} 的整数"
   done
   [ -n "$peer" ] || die "需要 --peer <iperf3服务器>, 选延迟低的, 测的是本机端口上限而非跨国链路"
   local iface; iface=$(detect_iface)
-  [ -n "$nominal" ] || nominal=$(detect_link_mbps "$iface")
-  [ -n "$nominal" ] || die "需要 --nominal <标称带宽Mbps>"
+  # 手工给了区间就完全按用户说的来, 不做不限速探测
+  local user_range=""; [ -n "$lo" ] && [ -n "$hi" ] && user_range=1
+  # 手工给了区间: 缺的标称值用区间上界顶上. 自动模式下 nominal/lo/hi/step
+  # 全部由后面的不限速探测决定, 这里不需要它们.
+  if [ -n "$user_range" ]; then
+    [ -n "$nominal" ] || nominal="$hi"
+    [ -n "$step" ] || step=$(calc_step "$nominal")
+  fi
   qdisc_guard "$iface" || { info "已取消"; return 0; }
-  [ -n "$step" ] || step=$(calc_step "$nominal")
-  [ -n "$lo" ] || lo=$(( nominal * 80 / 100 ))
-  [ -n "$hi" ] || hi=$(( nominal * 120 / 100 ))
+  is_posint "$cap" 100 100000 || die "--cap 必须是 100-100000 的整数"
 
   [ "$WIZARD" = 1 ] || traffic_mark
-  info "Scanning ${lo} -> ${hi} Mbit, step ${step}, ${dur}s each, threshold loss > ${thresh}%"
   info "Peer ${peer}:${PEER_PORT}"
-  echo
-  # 表头一律 ASCII：printf 的 %-Ns 按字节补齐, 中文列宽必错位
-  printf '  %-10s %12s %9s %8s  %s\n' "Rate/Mbit" "Goodput/Mbps" "Retrans" "Loss%" "Verdict"
 
   # 扫描会反复替换 qdisc；无论正常结束、拐点 break 还是被 Ctrl-C,
   # 都必须把机器恢复原状 —— 否则会被留在那个暴丢包的档位上.
@@ -956,13 +975,20 @@ cmd_sweep(){
   trap 'echo; warn "interrupted, restoring qdisc..."; qdisc_restore; exit 130' INT TERM HUP   # 中断退出是对的
 
   # 扫一段区间. 结果放进全局 LAST_OK(最后一个干净档) 与 BROKE_AT(重传跳变的那档)
-  LAST_OK=""; BROKE_AT=""; SLOW_HITS=0; PEER_TOO_SLOW=0
+  LAST_OK=""; BROKE_AT=""; SLOW_HITS=0; PEER_TOO_SLOW=0; BASE_LOSS=""
+  # 跳变判定: 既要超过绝对阈值, 也要明显高于本底. 两个条件都满足才算.
+  is_spike(){
+    awk -v l="$1" -v t="$thresh" -v b="${BASE_LOSS:-0}" 'BEGIN{
+      if (l <= t) exit 1
+      if (b > 0 && l < b*10) exit 1
+      exit 0
+    }' 2>/dev/null
+  }
   scan_range(){
     local a b st r res gp rt lp prev_gp=0 verdict
     a=$1; b=$2; st=$3
     for (( r=a; r<=b; r+=st )); do
-      tc qdisc del dev "$iface" root 2>/dev/null
-      tc qdisc add dev "$iface" root fq maxrate "${r}mbit" limit 40960 flow_limit 8192
+      apply_test_shaper "$iface" "$r" || { warn "failed to apply test shaper at ${r} Mbit"; return 1; }
       res=""
       # 进度提示交给 run_iperf 里的转圈, 这里不要再打占位符（会和转圈重叠）
       for _ in 1 2 3; do res=$(run_iperf "$peer" "$dur" "$par"); [ -n "$res" ] && break; sleep 8; done
@@ -970,10 +996,26 @@ cmd_sweep(){
       gp=$(echo "$res" | awk '{print $1}'); rt=$(echo "$res" | awk '{print $2}')
       lp=$(loss_pct "$rt" "$gp" "$dur")
       verdict="ok"
-      # 判定用丢包率而非绝对重传数 —— 见 loss_pct 上方注释
-      if awk -v l="$lp" -v t="$thresh" 'BEGIN{exit !(l > t)}' 2>/dev/null; then
-        printf '  %-10s %12s %9s %8s  %s\n' "$r" "$gp" "$rt" "$lp" "$(_c '0;31' 'loss spike')"
-        BROKE_AT=$r; return 0
+      # 第一档的丢包率当基线: 有些线路本底就有一点损, 拿绝对阈值一刀切会把它误判成拐点
+      [ -z "$BASE_LOSS" ] && BASE_LOSS="$lp"
+      # 判定用丢包率而非绝对重传数 —— 见 loss_pct 上方注释.
+      # 单次跳变可能只是公共节点被别人占用, 所以要复测: 3 次里 ≥2 次跳变才确认.
+      if is_spike "$lp"; then
+        local hits=1 j
+        for j in 2 3; do
+          sleep "$GAP"
+          local r2 g2 t2 l2
+          r2=$(run_iperf "$peer" "$dur" "$par"); [ -z "$r2" ] && continue
+          g2=$(echo "$r2" | awk '{print $1}'); t2=$(echo "$r2" | awk '{print $2}')
+          l2=$(loss_pct "$t2" "$g2" "$dur")
+          printf '  %-10s %12s %9s %8s  %s\n' "${r} (#${j})" "$g2" "$t2" "$l2" "recheck"
+          is_spike "$l2" && hits=$(( hits + 1 ))
+        done
+        if [ "$hits" -ge 2 ]; then
+          printf '  %-10s %12s %9s %8s  %s\n' "$r" "$gp" "$rt" "$lp" "$(_c '0;31' "loss spike (${hits}/3)")"
+          BROKE_AT=$r; return 0
+        fi
+        printf '  %-10s %12s %9s %8s  %s\n' "$r" "$gp" "$rt" "$lp" "$(_c '0;33' "transient (1/3), ignored")"
       fi
       # 吞吐远低于限速值、重传却很低 = 整形器压根没被触发, 瓶颈在对端.
       # 「重传低」这个条件必不可少：吞吐低但重传高是真撞限速器, 那是有效数据.
@@ -993,6 +1035,58 @@ cmd_sweep(){
     done
   }
 
+  # ── 不限速探测 ──────────────────────────────────────────────────────────
+  # 直接放开跑一次: 丢包低 = 没东西在打你 = 不用整形; 丢包高 = 有限速器, 再去找它.
+  #
+  # 关键: 拐点在【不限速吞吐之上】, 不是之下. 打穿限速器会让吞吐掉下来 ——
+  # LA 机不限速 481 Mbps / 丢包 5.70%, 而真实拐点在 530(限到 530 反而跑 499);
+  # 美国机不限速 1262 / 3.44%, 拐点 1340. 从不限速吞吐往下找会直接错过.
+  #
+  # 用单流: 多流的丢包归因不干净, 而且这个项目面向国内优化线路, 单流是实际场景.
+  local ug="" ulp=""
+  if [ -z "$user_range" ]; then
+    info "Unshaped probe (no rate limit, ${dur}s, 1 stream)"
+    printf '  %-10s %12s %9s %8s  %s\n' "Rate/Mbit" "Goodput/Mbps" "Retrans" "Loss%" "Verdict"
+    tc qdisc del dev "$iface" root 2>/dev/null
+    tc qdisc add dev "$iface" root fq 2>/dev/null
+    local ures urt
+    for _ in 1 2 3; do ures=$(run_iperf "$peer" "$dur" 1); [ -n "$ures" ] && break; sleep 8; done
+    qdisc_restore
+    [ -n "$ures" ] || { warn "unshaped probe failed, check the peer"; return 2; }
+    ug=$(echo "$ures" | awk '{print $1}'); urt=$(echo "$ures" | awk '{print $2}')
+    ulp=$(loss_pct "$urt" "$ug" "$dur")
+
+    if awk -v g="$ug" -v c="$cap" 'BEGIN{exit !(g > c)}'; then
+      printf '  %-10s %12s %9s %8s  %s\n' "none" "$ug" "$urt" "$ulp" "above cap"
+      echo
+      warn "不限速就能跑 ${ug} Mbps, 超过 ${cap} Mbit 的扫描上限."
+      echo "  本工具主要面向国内优化线路, 这个带宽下整形基本不会触发."
+      mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nABOVE_CAP=%s\nUNSHAPED=%s\n' "$cap" "$ug" > "$STATE_DIR/sweep.result"
+      traffic_report
+      return 3
+    fi
+
+    if ! awk -v l="$ulp" -v t="$thresh" 'BEGIN{exit !(l > t)}'; then
+      printf '  %-10s %12s %9s %8s  %s\n' "none" "$ug" "$urt" "$ulp" "ok"
+      echo
+      warn "不限速跑 ${ug} Mbps, 丢包 ${ulp}%, 未检测到限速器."
+      mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nUNSHAPED=%s\n' "$ug" > "$STATE_DIR/sweep.result"
+      traffic_report
+      return 3
+    fi
+
+    printf '  %-10s %12s %9s %8s  %s\n' "none" "$ug" "$urt" "$ulp" "$(_c '0;31' 'loss -- policer present')"
+    # 拐点在 ug 之上, 所以区间从 ug 稍下方起, 往上扫
+    lo=$(awk -v g="$ug" 'BEGIN{printf "%d", g*0.95}')
+    hi=$(awk -v g="$ug" -v c="$cap" 'BEGIN{v=g*1.25; if(v>c)v=c; printf "%d", v}')
+    [ -n "$nominal" ] || nominal=$(awk -v g="$ug" 'BEGIN{printf "%d", g}')
+    [ -n "$step" ] || step=$(calc_step "$nominal")
+    info "Policer present, scanning ${lo} -> ${hi} Mbit"
+  fi
+
+  echo
+  info "Scanning ${lo} -> ${hi} Mbit, step ${step}, ${dur}s each, threshold loss > ${thresh}%"
+  printf '  %-10s %12s %9s %8s  %s\n' "Rate/Mbit" "Goodput/Mbps" "Retrans" "Loss%" "Verdict"
   scan_range "$lo" "$hi" "$step"
 
   if [ "$PEER_TOO_SLOW" = 1 ]; then
@@ -1032,6 +1126,17 @@ cmd_sweep(){
   echo
   local knee="$LAST_OK"
   [ -n "$knee" ] || { warn "no usable rate measured, check that the peer is reachable"; return 2; }
+
+  # 扫到区间上界都没有丢包跳变 —— 说明扫描范围内不存在限速器.
+  # 早期版本把区间上界当成拐点, 于是给一台根本没有 policer 的机器套了个上限
+  # (用户一台 500M 标称的机器被设成 585, 而它实际能跑 9.3 Gbps).
+  if [ -z "$BROKE_AT" ]; then
+    echo
+    warn "扫到 ${hi} Mbit 仍未出现丢包跳变, 未检测到限速器."
+    mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nSCANNED_TO=%s\n' "$hi" > "$STATE_DIR/sweep.result"
+    traffic_report
+    return 3
+  fi
   # 安全余量按标称带宽分档. 早期用固定 20Mbit, 在 300M 机器上白丢 19Mbps
   # （实测 300 档重传比 280 档还少）, 说明一个数字套所有带宽不合理.
   [ -n "$margin" ] || margin=$(calc_margin "$nominal")
@@ -1313,8 +1418,7 @@ validate_peer(){
   qdisc_save "$iface"
   # 早期版本这里没有任何 trap: 中断就把机器留在标称 40% 的限速上, 直到重启
   trap 'qdisc_restore; exit 130' INT TERM HUP
-  tc qdisc del dev "$iface" root 2>/dev/null
-  tc qdisc add dev "$iface" root fq maxrate "${rate}mbit" 2>/dev/null
+  apply_test_shaper "$iface" "$rate" || { qdisc_restore; echo "unreachable"; return 1; }
   local res rt
   for _ in 1 2; do res=$(run_iperf "$peer" 8 2); [ -n "$res" ] && break; sleep 5; done
   trap - INT TERM HUP
@@ -1453,10 +1557,12 @@ wizard(){
   echo
   echo "    你这台机器的带宽是多少 Mbps？常见 100 / 200 / 300 / 500 / 1000."
   echo
-  printf "    %s建议手动输入. %s回车会在执行阶段现场实测一个估值……\n" "$yellow" "$plain"
   if [ "$HAVE_IPERF3" = 1 ]; then
+    printf "    %s建议手动输入. %s回车会在执行阶段现场实测一个估值……\n" "$yellow" "$plain"
     echo "    跳过扫描. 填 0 表示不做整形（端口没有限速器时选这个）."
     echo "    已经知道限速值？输入 m 跳过拐点扫描直接指定"
+  else
+    printf "    %s没有 iperf3, 必须手动填一个数字.%s\n" "$yellow" "$plain"
   fi
   echo
   # MANUAL_RATE 的三种状态：""=正常扫描 / 数字=直接按该值整形 / "off"=完全不整形
@@ -1553,7 +1659,18 @@ wizard(){
   else                              _conf "预计耗时" "约 10 分钟"; fi
   if [ -n "$MANUAL_RATE" ]; then _conf "预计流量" "很少"
   elif [ "$bw" = auto ]; then   _conf "预计流量" "带宽实测后才能估"
-  else                          _conf "预计流量" "约 $(estimate_traffic_gb "$bw") GB"; fi
+  else
+    _conf "预计流量" "约 $(estimate_traffic_gb "$bw") GB"
+    _conf ""         "先测一档判断有没有限速器, 没有就到此为止"
+  fi
+  # 2G 以上扫描代价陡增, 且代理场景的实际流量通常远达不到端口上限.
+  # 只提醒, 不阻止 —— 用户可能就是要为大流量场景调.
+  if [ -z "$MANUAL_RATE" ] && [ "$bw" != auto ] && [ "$bw" -gt 2000 ] 2>/dev/null; then
+    echo
+    warn "带宽 ${bw} Mbps 超过 2000, 拐点扫描代价很高."
+    echo "      代理场景下实际流量通常远达不到这个值, 整形器很可能从不触发."
+    echo "      想跳过的话, 重跑时带宽那一问填 0."
+  fi
   rule
   confirm "  开始调优？" y || { info "已取消, 未做任何改动"; return 0; }
 
@@ -1600,24 +1717,28 @@ wizard(){
   printf '\n  %s[3/5] Policer sweep%s\n' "$bold" "$plain"
   cmd_sweep --peer "$peer" --nominal "$bw" || warn "sweep did not produce a knee, shaping skipped"
 
+  local no_knee=""
   if [ -f "$STATE_DIR/sweep.result" ]; then
+    no_knee=$(awk -F= '/^NO_KNEE/{print $2}' "$STATE_DIR/sweep.result")
     knee=$(awk -F= '/^KNEE/{print $2}'      "$STATE_DIR/sweep.result")
     rate=$(awk -F= '/^RECOMMEND/{print $2}' "$STATE_DIR/sweep.result")
     [ -n "$knee" ] && [ -n "$rate" ] && margin=$(( knee - rate ))
   fi
 
   printf '\n  %s[4/5] Apply shaping%s\n' "$bold" "$plain"
-  if [ -n "$rate" ]; then cmd_shape --rate "$rate"; else warn "no knee measured, shaping skipped"; fi
+  if [ -n "$rate" ]; then cmd_shape --rate "$rate"
+  elif [ -n "$no_knee" ]; then info "no policer detected, shaping intentionally skipped"
+  else warn "no knee measured, shaping skipped"; fi
 
   printf '\n  %s[5/5] Verify%s\n' "$bold" "$plain"
   command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
 
-  wizard_result "$bw" "$rate" "$knee" "$margin" "$ram"
+  wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "$no_knee"
 }
 
 # 结果段落. 正常流程和"手动指定整形值"两条路径共用, 避免两份重复的排版代码.
-wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内存MB>
-  local bw="$1" rate="$2" knee="$3" margin="$4" ram="$5"
+wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内存MB> [无拐点]
+  local bw="$1" rate="$2" knee="$3" margin="$4" ram="$5" no_knee="${6:-}"
   printf '\n  %s════ 结果 ══════════════════════════════════════════════%s\n' "$bold" "$plain"
   echo
   if [ -n "$knee" ]; then
@@ -1627,6 +1748,10 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
     echo
   elif [ -n "$rate" ]; then
     _conf "已应用整形"   "${rate} Mbit"
+    echo
+  elif [ -n "$no_knee" ]; then
+    _conf "整形"         "未设置"
+    _conf "原因"         "扫描未发现限速器, 加整形只会限制自己"
     echo
   else
     _conf "整形"         "未设置"
@@ -1695,7 +1820,7 @@ menu_loop(){
       *) warn "Invalid selection" ;;
     esac
     echo
-    printf "  ${yellow}Press any key to return to menu...${plain}"
+    printf "  ${yellow}按任意键返回${plain}"
     read -rsn1 </dev/tty 2>/dev/null || read -r </dev/tty 2>/dev/null || true
     echo
   done

@@ -13,7 +13,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 固定版本并校验:
 
 ```bash
-V=v0.3.6
+V=v0.3.7
 curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/tcpfit.sh &&
 curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/install.sh &&
 curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/SHA256SUMS &&
@@ -106,6 +106,18 @@ python3 orchestrator/fleet.py verify
 | 出向整形 | HTB 全局上限 + fq 叶子 pacing |
 
 共 32 个 sysctl 参数. 缓冲区和整形值按每台机器实测推导, 不是固定值.
+
+## 拐点扫描怎么工作
+
+先不限速跑一次, 看有没有东西在打你:
+
+| 结果 | 动作 |
+|---|---|
+| 丢包低 | 没有限速器, 不整形 |
+| 丢包高 | 有限速器, 从实测吞吐往上扫找拐点 |
+| 吞吐 > 2500 Mbit | 超出扫描上限, 不扫（可用 `--cap` 调整） |
+
+拐点在"不限速吞吐"的**上面** —— 打穿限速器会让吞吐掉下来, 所以往上找.
 
 ## 回滚
 
