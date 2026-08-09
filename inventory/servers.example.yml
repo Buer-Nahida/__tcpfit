@@ -1,0 +1,57 @@
+# tcpfit 服务器清单模板
+#
+# 复制成 servers.yml 后填自己的机器. servers.yml 已被 .gitignore 忽略（含密码）.
+#   cp servers.example.yml servers.yml && chmod 600 servers.yml
+
+# 所有机器的公共默认值, 可被单机覆盖
+defaults:
+  user: root
+  port: 22
+  role: mixed          # proxy / bulk / mixed
+  # peer: 用于 sweep 实测限速拐点的 iperf3 服务器.
+  #   关键：要选**离目标机近**的（延迟越低越好）.
+  #   sweep 测的是"本机端口的限速器在哪", 不是跨国链路质量.
+  #   用远端会把链路损耗混进来, 测出的拐点偏低.
+
+servers:
+  # ── 洛杉矶 CN 优化线路, 跑代理 ──
+  - name: la-panstar
+    host: 1.2.3.4
+    password: "改成你的密码"        # 或用 key: ~/.ssh/id_ed25519
+    role: proxy                     # 并发连接多 → 缓冲区默认值取保守值
+    bandwidth: 500                  # 标称 Mbps, 用于推导 BDP 和 sweep 起止范围
+    peer: la.speedtest.clouvider.net
+    tags: [cn-optimized, proxy]
+    # shape_rate: 510               # sweep 测出来后填这里, 之后 shape 就不用 --auto
+
+  # ── 东京, 跑大流量下载 ──
+  - name: tokyo-bulk
+    host: 5.6.7.8
+    key: ~/.ssh/id_ed25519
+    role: bulk                      # 少数大流 → 缓冲区默认值可以激进
+    bandwidth: 1000
+    rtt: 40                         # 已知 RTT 可写死, 省掉目标机自测
+    peer: speedtest.tokyo.linode.com
+    tags: [asia, bulk]
+
+  # ── 一台不需要整形的（端口没有硬限速器）──
+  - name: hetzner-de
+    host: 9.10.11.12
+    port: 2222
+    key: ~/.ssh/id_ed25519
+    role: mixed
+    bandwidth: 1000
+    peer: speed.hetzner.de
+    tags: [eu]
+    # 没有 shape_rate 且不跑 --auto, 就只做基础调优不加整形.
+    # 判断依据见 docs/FINDINGS.md 第 8 条：
+    #   限速后吞吐明显下降 → 该机没有硬限速器, 别限速
+    #   限速后吞吐不变或上升 → 撞限速器了, 必须限速
+
+# ── 常用公共 iperf3 服务器（选离目标机最近的）──
+#   北美西  la.speedtest.clouvider.net
+#   北美东  nyc.speedtest.clouvider.net
+#   欧洲    lon.speedtest.clouvider.net / speedtest.lu
+#   亚洲    speedtest.tokyo.linode.com / speedtest.singapore.linode.com
+# 注意：公共服务器一次只接一个测试, agent 已内置重试；
+#       多机同时 sweep 请给不同机器配不同 peer, 否则会互相排队.
