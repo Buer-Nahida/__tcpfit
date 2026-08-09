@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -73,7 +73,38 @@ take_lock(){
   # 永久重定向, 把整个脚本的 stderr 都吞掉, 所有 die/warn 就都看不见了.
   [ -w "$(dirname "$LOCK_FILE")" ] || return 0
   exec 9>"$LOCK_FILE" || return 0
-  flock -n 9 || die "另一个 tcpfit 正在运行（锁: $LOCK_FILE）. 等它结束再试"
+  flock -n 9 && return 0
+
+  # 锁被占: 可能真有另一个在跑, 也可能是上次异常退出(SSH 断线/被 kill)卡住了.
+  # 给出持有者和已运行时长, 让用户能判断, 并提供一键结束 —— 光说"等它结束"
+  # 遇到卡死的情况没有出路. 而且 bash <(curl ...) 起的进程 cmdline 是
+  # /dev/fd/63, 用 pkill -f tcpfit 根本找不到它.
+  local pids age
+  # 排除自己 —— 上面已经 exec 9> 打开了锁文件, 不排掉会把自己也列成持有者
+  pids=$(fuser "$LOCK_FILE" 2>/dev/null | tr -s ' ' | tr ' ' '\n' | grep -vx "$$" | grep -x '[0-9]*' | tr '\n' ' ')
+  warn "另一个 tcpfit 正在运行（锁: $LOCK_FILE）"
+  if [ -n "$pids" ]; then
+    echo "      持有者:"
+    for _p in $pids; do
+      age=$(ps -o etime= -p "$_p" 2>/dev/null | tr -d ' ')
+      [ -n "$age" ] && printf '        PID %-8s 已运行 %s\n' "$_p" "$age"
+    done
+  fi
+  echo "      跑得太久多半是上次异常退出卡住了."
+  echo
+  if confirm "  结束它并继续？" n; then
+    exec 9>&-                                   # 先松开自己, 否则会把自己一起杀掉
+    fuser -k -TERM "$LOCK_FILE" >/dev/null 2>&1  # 先 TERM, 让对方的 trap 有机会恢复 qdisc
+    sleep 3
+    fuser -k -KILL "$LOCK_FILE" >/dev/null 2>&1
+    sleep 1
+    reap_iperf
+    exec 9>"$LOCK_FILE" || return 0
+    flock -n 9 || die "锁仍被占用, 手动查看: fuser -v $LOCK_FILE"
+    ok "已结束, 继续"
+    return 0
+  fi
+  die "已取消"
 }
 
 need_root(){ [ "$(id -u)" = 0 ] || die "需要 root 权限"; }
