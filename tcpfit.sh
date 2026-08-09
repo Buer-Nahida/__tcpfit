@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.4.3"
+VERSION="0.4.4"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -714,13 +714,16 @@ cmd_harden(){
   done
   [ -n "$swap_size" ] || die "需要 --swap <大小>, 例如 --swap 2G 或 --swap 2"
 
+  # 单位一律按 GB. "2" 和 "2G" 都收 —— 向导和文档里写的都是 2G, 只收纯数字
+  # 会把它们全挡掉（v0.4.3 就是这样, 向导结尾的 swap 提示按 y 之后直接 die 退出）.
+  # 但不收 "2M": fallocate 会建 2MB, 而失败回退的 dd 建 2GB, 两条路差 1000 倍.
+  local gb="${swap_size%[Gg]}"
+  is_posint "$gb" 1 20 || die "swap 大小请填 1-20 之间的整数, 单位 GB（例如 2 或 2G）"
+  swap_size="${gb}G"
+
+  # 校验通过再存快照, 打错参数不该留下状态
   take_snapshot        # harden 会往 $SYSCTL_FILE 追加 vm.swappiness,
                        # 不存快照的话之后跑 tune 会因"有配置无快照"直接中止
-  # 允许只写数字, 按 GB 算 —— 菜单里让用户输 1-20 的数字
-  # 只收纯数字, 按 GB 算. 早期允许 "2M" 这类写法, 但 fallocate 建 2MB 而
-  # 失败回退的 dd 建 2GB, 两条路差 1000 倍.
-  is_posint "$swap_size" 1 20 || die "swap 大小请填 1-20 之间的整数（单位 GB）"
-  local gb="$swap_size"; swap_size="${gb}G"
 
   if swapon --show 2>/dev/null | grep -q .; then
     info "已有 swap, 跳过: $(free -h | awk '/Swap/{print $2}')"
