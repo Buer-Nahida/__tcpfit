@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.3.8"
+VERSION="0.3.9"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -620,9 +620,11 @@ EOF
   # 不吞错误: 内核不支持某个参数时要让用户看见, 而不是照样报"applied"
   local serr; serr=$(sysctl -qp "$SYSCTL_FILE" 2>&1 >/dev/null)
   if [ -n "$serr" ]; then
-    warn "some sysctl keys were rejected by the kernel:"
+    # 个别参数被内核拒绝很常见(不同内核版本支持的项不一样), 不是整体失败.
+    # 用户看到 warning 容易以为调优挂了, 措辞要说清楚.
+    warn "以下参数当前内核不支持, 已跳过, 不影响其他调优:"
     echo "$serr" | sed 's/^/      /' >&2
-    ok "sysctl applied with warnings: $SYSCTL_FILE"
+    ok "sysctl applied: $SYSCTL_FILE"
   else
     ok "sysctl applied: $SYSCTL_FILE"
   fi
@@ -810,7 +812,13 @@ qdisc_save(){   # qdisc_save <iface>
   QSAVE_IFACE="$1"
   QSAVE_KIND=$(tc qdisc show dev "$1" 2>/dev/null | awk '$1=="qdisc"{print $2; exit}')
 }
+# 把本脚本起的 iperf3 全部收掉. 只杀自己的子进程, 不动用户手工跑的.
+# 收掉本脚本起的 iperf3. 用进程组匹配 —— iperf3 的父进程是 timeout 不是本脚本,
+# 按 -P $$ 匹配不到. 只杀同组的, 不动用户手工跑的.
+reap_iperf(){ pkill -g $$ -x iperf3 2>/dev/null; pkill -g $$ -x timeout 2>/dev/null; return 0; }
+
 qdisc_restore(){
+  reap_iperf
   [ -n "$QSAVE_IFACE" ] || return 0
   tc qdisc del dev "$QSAVE_IFACE" root 2>/dev/null
   if [ -x "$QDISC_SCRIPT" ]; then
@@ -885,7 +893,7 @@ cmd_probe(){
 # $1=peer $2=dur $3=parallel [$4=port]  -> "goodput retrans"
 # 公共节点开 5201-5210 十个实例, 指定端口忙时自动换 —— 否则单端口一忙就整个失败.
 run_iperf(){
-  local out raw tmp port ports first="${4:-${PEER_PORT:-5201}}"
+  local out raw tmp port ports pid first="${4:-${PEER_PORT:-5201}}"
   ports="$first"
   for p in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210; do
     [ "$p" = "$first" ] || ports="$ports $p"
@@ -893,9 +901,21 @@ run_iperf(){
   tmp=$(mktemp)
   for port in $ports; do
     : > "$tmp"
-    timeout $(( $2 + 25 )) iperf3 -c "$1" -p "$port" -t "$2" -P "$3" -f m >"$tmp" 2>&1 &
-    spin_wait $! "测速中… ${2}s × ${3} 流  →  $1:$port"
-    grep -q "busy running a test\|control socket has closed\|Connection refused" "$tmp" 2>/dev/null || break
+    timeout --foreground $(( $2 + 25 )) iperf3 -c "$1" -p "$port" -t "$2" -P "$3" -f m >"$tmp" 2>&1 &
+    pid=$!
+    # --foreground 是必须的: timeout 默认把子进程放进【独立进程组】(方便超时时杀整组),
+    # 结果 Ctrl-C 发给脚本进程组的 SIGINT 根本到不了 iperf3, 它会继续满速跑到
+    # timeout 到期 —— 9Gbps 的机器上那是十几 GB 白烧. 实测验证过:
+    #   默认        iperf3 进程组 ≠ 脚本组, Ctrl-C 后残留 1 个
+    #   --foreground 两者相同,        Ctrl-C 后残留 0 个
+    # 下面的 trap 是第二道保险, 走 kill 路径时用.
+    trap 'kill -TERM "$pid" 2>/dev/null; pkill -P "$pid" 2>/dev/null; rm -f "$tmp"; exit 130' INT TERM HUP
+    spin_wait "$pid" "测速中… ${2}s × ${3} 流  →  $1:$port"
+    trap - INT TERM HUP
+    # 判据是"有没有拿到有效结果", 不是枚举报错文案 —— iperf3 在服务端忙的时候
+    # 会随机吐两种错, 早期只认 "busy running a test", 碰上
+    # "unable to send control message: Connection reset by peer" 就直接放弃换端口了.
+    grep -qE "$( [ "$3" -gt 1 ] && echo 'SUM.*sender' || echo 'sender' )" "$tmp" 2>/dev/null && break
   done
   raw=$(cat "$tmp"); rm -f "$tmp"
   [ "${NETTUNE_VERBOSE:-0}" = 1 ] && echo "$raw" | sed 's/^/      | /' >&2
@@ -987,7 +1007,12 @@ cmd_sweep(){
   scan_range(){
     local a b st r res gp rt lp prev_gp=0 verdict
     a=$1; b=$2; st=$3
-    for (( r=a; r<=b; r+=st )); do
+    # 终点必测: 168→221 步长 20 只会测 168/188/208, 而提示里写的是"扫到 221",
+    # 上界从来没被验证过. 补一档把终点带上.
+    local pts="" _r
+    for (( _r=a; _r<=b; _r+=st )); do pts="$pts $_r"; done
+    case " $pts " in *" $b "*) ;; *) pts="$pts $b" ;; esac
+    for r in $pts; do
       apply_test_shaper "$iface" "$r" || { warn "failed to apply test shaper at ${r} Mbit"; return 1; }
       res=""
       # 进度提示交给 run_iperf 里的转圈, 这里不要再打占位符（会和转圈重叠）
@@ -1077,8 +1102,14 @@ cmd_sweep(){
 
     printf '  %-10s %12s %9s %8s  %s\n' "none" "$ug" "$urt" "$ulp" "$(_c '0;31' 'loss -- policer present')"
     # 拐点在 ug 之上, 所以区间从 ug 稍下方起, 往上扫
+    # 打穿限速器后 goodput 会掉下来, 丢得越狠掉得越多, 所以上界要按丢包率放宽:
+    # 24% 丢包时真实拐点可能比 1.25×goodput 高得多(群里碰到过 177Mbps/24% 的例子).
     lo=$(awk -v g="$ug" 'BEGIN{printf "%d", g*0.95}')
-    hi=$(awk -v g="$ug" -v c="$cap" 'BEGIN{v=g*1.25; if(v>c)v=c; printf "%d", v}')
+    hi=$(awk -v g="$ug" -v c="$cap" -v l="$ulp" 'BEGIN{
+      k = 1.25 + l/100*2          # 丢包越高, 真实拐点离 goodput 越远
+      if (k > 2.5) k = 2.5
+      v = g*k; if (v > c) v = c
+      printf "%d", v }')
     [ -n "$nominal" ] || nominal=$(awk -v g="$ug" 'BEGIN{printf "%d", g}')
     [ -n "$step" ] || step=$(calc_step "$nominal")
     info "Policer present, scanning ${lo} -> ${hi} Mbit"
@@ -1118,6 +1149,11 @@ cmd_sweep(){
     printf '  %-10s %12s %9s %8s  %s\n' "Rate/Mbit" "Goodput/Mbps" "Retrans" "Loss%" "Verdict"
     BROKE_AT=""
     scan_range $(( LAST_OK + fine )) $(( coarse_broke - fine )) "$fine"
+    # 细扫在更细的档位上可能都不触发阈值(拐点就在 coarse_broke 那一档).
+    # 不恢复的话 BROKE_AT 是空的, 后面会误判成"未检测到限速器"而不整形 ——
+    # 群里实测碰到: 粗扫 536 已经 0.47%-0.63% 丢包, 细扫 521/526/531 都干净,
+    # 结果报"未检测到限速器". 粗扫的结论必须保留.
+    [ -n "$BROKE_AT" ] || BROKE_AT="$coarse_broke"
   fi
 
   echo
@@ -1132,6 +1168,16 @@ cmd_sweep(){
   # (用户一台 500M 标称的机器被设成 585, 而它实际能跑 9.3 Gbps).
   if [ -z "$BROKE_AT" ]; then
     echo
+    if [ -n "$ug" ] && awk -v l="${ulp:-0}" -v t="$thresh" 'BEGIN{exit !(l > t)}'; then
+      # 不限速时明明高丢包, 说明限速器确实存在, 只是不在扫描范围内 ——
+      # 这跟"没有限速器"是两回事, 不能混为一谈.
+      warn "不限速时丢包 ${ulp}%, 但扫到上界 ${hi} Mbit 仍未定位到拐点."
+      echo "  限速器应该存在, 只是不在本次扫描范围内. 可以扩大范围重扫:"
+      echo "    $(disp) sweep --peer <对端> --from ${hi} --to $(( hi * 2 ))"
+      mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nOUT_OF_RANGE=1\nSCANNED_TO=%s\n' "$hi" > "$STATE_DIR/sweep.result"
+      traffic_report
+      return 3
+    fi
     warn "扫到 ${hi} Mbit 仍未出现丢包跳变, 未检测到限速器."
     mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nSCANNED_TO=%s\n' "$hi" > "$STATE_DIR/sweep.result"
     traffic_report
@@ -1365,7 +1411,7 @@ auto_pick_peer(){
     printf '  %-34s %-10s %-10s RTT %-6s ' "$cand" "$name" "$prov" "${rtt}ms" >&2
     # 先探端口, 把"根本不跑 iperf3/被墙"和"跑着但占线"分开 ——
     # 早期两者都报"占线", 用户完全看不出真实原因
-    if ! timeout 6 bash -c "cat < /dev/null > /dev/tcp/$cand/5201" 2>/dev/null; then
+    if ! timeout --foreground 6 bash -c "cat < /dev/null > /dev/tcp/$cand/5201" 2>/dev/null; then
       echo "port closed" >&2; continue
     fi
     # 没装 iperf3 时无法做占线探测（iperf3 要等确认之后才装）,
@@ -1378,7 +1424,7 @@ auto_pick_peer(){
     # 早期只试 5201, 等于放着 9 个空闲实例不用去跟全世界抢一个, 动不动就"占线".
     local gp="" try
     for try in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210; do
-      if timeout 25 iperf3 -c "$cand" -p "$try" -t 3 -P 1 >/dev/null 2>&1; then gp="$try"; break; fi
+      if timeout --foreground 25 iperf3 -c "$cand" -p "$try" -t 3 -P 1 >/dev/null 2>&1; then gp="$try"; break; fi
     done
     if [ -n "$gp" ]; then
       if [ "$rtt" -le "$ideal" ] 2>/dev/null; then
@@ -1688,6 +1734,11 @@ wizard(){
   fi
   cmd_tune --role "$role" --bw "$bw" || die "base tuning failed"
 
+  # 这四个必须在所有分支之前声明. set -u 下, 只要有一条路径没赋值,
+  # 结尾传给 wizard_result 时就是 unbound variable —— v0.3.8 的"未检测到限速器"
+  # 和"填 0 不整形"两条路都踩了这个(GitHub #1 #2).
+  local knee="" rate="" margin="" no_knee=""
+
   # 手动指定了限速值（或选了不整形）→ 路径验证和拐点扫描都没有意义, 直接跳到应用
   if [ -n "$MANUAL_RATE" ]; then
     printf '\n  %s[2/3] Apply shaping%s\n' "$bold" "$plain"
@@ -1696,7 +1747,7 @@ wizard(){
       rate=""
     else
       cmd_shape --rate "$MANUAL_RATE"
-      rate="$MANUAL_RATE"; knee=""; margin=""
+      rate="$MANUAL_RATE"
     fi
     printf '\n  %s[3/3] Verify%s\n' "$bold" "$plain"
     command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
@@ -1719,7 +1770,6 @@ wizard(){
   printf '\n  %s[3/5] Policer sweep%s\n' "$bold" "$plain"
   cmd_sweep --peer "$peer" --nominal "$bw" || warn "sweep did not produce a knee, shaping skipped"
 
-  local no_knee=""
   if [ -f "$STATE_DIR/sweep.result" ]; then
     no_knee=$(awk -F= '/^NO_KNEE/{print $2}' "$STATE_DIR/sweep.result")
     knee=$(awk -F= '/^KNEE/{print $2}'      "$STATE_DIR/sweep.result")
@@ -1740,7 +1790,7 @@ wizard(){
 
 # 结果段落. 正常流程和"手动指定整形值"两条路径共用, 避免两份重复的排版代码.
 wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内存MB> [无拐点]
-  local bw="$1" rate="$2" knee="$3" margin="$4" ram="$5" no_knee="${6:-}"
+  local bw="${1:-}" rate="${2:-}" knee="${3:-}" margin="${4:-}" ram="${5:-0}" no_knee="${6:-}"
   printf '\n  %s════ 结果 ══════════════════════════════════════════════%s\n' "$bold" "$plain"
   echo
   if [ -n "$knee" ]; then
