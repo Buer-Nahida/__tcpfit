@@ -1,3 +1,4 @@
+# 多机编排尚未上线, 未在真实环境验证过. 暂时不建议使用.
 # tcpfit 服务器清单模板
 #
 # 复制成 servers.yml 后填自己的机器. servers.yml 已被 .gitignore 忽略（含密码）.
@@ -44,7 +45,6 @@ servers:
     peer: speed.hetzner.de
     tags: [eu]
     # 没有 shape_rate 且不跑 --auto, 就只做基础调优不加整形.
-    # 判断依据见 docs/FINDINGS.md 第 8 条：
     #   限速后吞吐明显下降 → 该机没有硬限速器, 别限速
     #   限速后吞吐不变或上升 → 撞限速器了, 必须限速
 

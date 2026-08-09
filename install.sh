@@ -7,7 +7,7 @@
 #      curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/install.sh | bash
 #      然后: tcpfit detect
 #
-#   2) 在控制端跑（装完整项目, 管理多台机器）
+#   2) 在控制端跑（装完整项目, 管理多台机器 —— 未上线, 尚未在真实环境验证）
 #      curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/install.sh | bash -s -- --full
 #      然后: cd /opt/tcpfit && python3 orchestrator/fleet.py detect
 
@@ -83,7 +83,7 @@ else
     | tar xz -C "$PROJECT_DIR" --strip-components=1 || die "下载失败"
 fi
 
-chmod +x "$PROJECT_DIR/tcpfit" "$PROJECT_DIR/orchestrator/fleet.py" 2>/dev/null || true
+chmod +x "$PROJECT_DIR/tcpfit.sh" "$PROJECT_DIR/orchestrator/fleet.py" 2>/dev/null || true
 ok "项目已就绪: $PROJECT_DIR"
 
 # 控制端依赖

@@ -13,10 +13,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 固定版本并校验:
 
 ```bash
-V=v0.3.5
-curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/tcpfit.sh
-curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/SHA256SUMS
-sha256sum -c SHA256SUMS
+V=v0.3.6
+curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/tcpfit.sh &&
+curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/install.sh &&
+curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/SHA256SUMS &&
+sha256sum -c SHA256SUMS &&
 bash tcpfit.sh
 ```
 
@@ -72,7 +73,10 @@ tcpfit rollback                                   # 回滚全部改动
 tcpfit update                                     # 检查更新
 ```
 
-## 多机
+## 多机（未上线）
+
+多机编排还没在真实环境验证过, 暂时不建议使用. 下面的用法仅供参考.
+
 
 ```bash
 cp inventory/servers.example.yml inventory/servers.yml
@@ -125,6 +129,9 @@ swap 默认不动 —— 删掉正在用的 swap 可能让机器立刻 OOM, 要�
 /etc/modules-load.d/tcpfit-bbr.conf
 /var/lib/tcpfit/
 ```
+
+用了 `harden --swap` 还会创建 `/swapfile` 并往 `/etc/fstab` 加一行 —— 这两个 `rollback` 默认不动,
+要一并撤销加 `--purge-swap`. 缺 iperf3 时经你确认后会用包管理器安装它.
 
 ## 已知限制
 
