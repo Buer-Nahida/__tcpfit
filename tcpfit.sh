@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.4.4"
+VERSION="0.4.5"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -1931,7 +1931,17 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
     echo "    本机 ${ram} MB 内存且没有 swap. 跑代理时 TCP 缓冲区可能撑爆内存,"
     echo "    代理进程被系统杀掉."
     echo
-    confirm "  创建 2G swap？" y && cmd_harden --swap 2G
+    echo "    输入 1-20 的数字（单位 GB）, 推荐 1-4；回车 = 2；输入 0 = 不创建."
+    echo
+    # 这里必须自己校验. 直接把输入丢给 cmd_harden 的话, 非法值会触发它的 die,
+    # 整个脚本跟着退出, 连"调优完成"都打不出来 —— v0.4.3 就是这么挂的.
+    local sg
+    while true; do
+      sg=$(ask "  swap 大小 GB" "2")
+      [ "$sg" = 0 ] && break
+      if is_posint "${sg%[Gg]}" 1 20; then cmd_harden --swap "$sg"; break; fi
+      warn "  请输入 1-20 之间的整数, 或 0 跳过"
+    done
   fi
   echo
   ok "调优完成."
