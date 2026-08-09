@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.3.9"
+VERSION="0.3.10"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -1233,35 +1233,54 @@ cmd_status(){
 # 验证「本机端口能力」. 刻意用近端对端 —— 测的是服务器出口能发多快、
 # 整形有没有生效, 不是到国内的速度（那取决于线路质量, 见 cmd_cntest）.
 # 实测 + 判定拆开：一键流程要把执行日志（英文）和结论（中文）分在两段里打印.
-VS1=""; VR1=""; VS4=""; VR4=""
+VS1=""; VR1=""; VS4=""; VR4=""; VDUR=10
 verify_measure(){
   local peer="$1" res
   VS1=""; VR1=""; VS4=""; VR4=""
-  res=$(run_iperf "$peer" 10 1); [ -n "$res" ] && { VS1=$(echo "$res"|awk '{print $1}'); VR1=$(echo "$res"|awk '{print $2}'); }
+  res=$(run_iperf "$peer" "$VDUR" 1); [ -n "$res" ] && { VS1=$(echo "$res"|awk '{print $1}'); VR1=$(echo "$res"|awk '{print $2}'); }
   sleep 3
-  res=$(run_iperf "$peer" 10 4); [ -n "$res" ] && { VS4=$(echo "$res"|awk '{print $1}'); VR4=$(echo "$res"|awk '{print $2}'); }
+  res=$(run_iperf "$peer" "$VDUR" 4); [ -n "$res" ] && { VS4=$(echo "$res"|awk '{print $1}'); VR4=$(echo "$res"|awk '{print $2}'); }
 }
 
 # 打印验证结果表 + 结论. $1 = 当前整形值(Mbit, 可空)
+#
+# 判定一律用丢包率, 不用绝对重传次数 —— 同样 14574 次, 300M 机上是 5.6% 的灾难,
+# 9G 机上只有 0.19% 属正常. sweep 早就改成丢包率了, verify 这里当时漏了同步,
+# 结果给一台 5Gbps 的机器报"重传偏高, 整形值可能设高了", 而那台根本没装整形.
+#
+#   < 0.05%    干净
+#   0.05-0.5%  略高, 通常不影响
+#   0.5-1%     偏高, 值得查
+#   > 1%       很糟, 多半撞了限速器或链路有问题
+# 参照: 实测干净的机器在 0.0013%-0.0017%, 真撞限速器是 1.35%-6.50%.
 verify_verdict(){
-  local target="${1:-}"
+  local target="${1:-}" lp1="" lp4=""
+  [ -n "$VS1" ] && [ -n "$VR1" ] && lp1=$(loss_pct "$VR1" "$VS1" "$VDUR")
+  [ -n "$VS4" ] && [ -n "$VR4" ] && lp4=$(loss_pct "$VR4" "$VS4" "$VDUR")
   echo "  验证"
-  printf '      %s %s %s\n' "$(_pad "" 14)" "$(_rpad "吞吐 Mbps" 12)" "$(_rpad "重传" 11)"
-  printf '      %s %s %s\n' "$(_pad "单流" 14)"     "$(_rpad "${VS1:-测试失败}" 12)" "$(_rpad "${VR1:--}" 11)"
-  printf '      %s %s %s\n' "$(_pad "4 流并发" 14)" "$(_rpad "${VS4:-测试失败}" 12)" "$(_rpad "${VR4:--}" 11)"
+  printf '      %s %s %s %s\n' "$(_pad "" 14)" "$(_rpad "吞吐 Mbps" 12)" "$(_rpad "重传" 9)" "$(_rpad "丢包率" 10)"
+  printf '      %s %s %s %s\n' "$(_pad "单流" 14)"     "$(_rpad "${VS1:-测试失败}" 12)" "$(_rpad "${VR1:--}" 9)" "$(_rpad "${lp1:+${lp1}%}" 10)"
+  printf '      %s %s %s %s\n' "$(_pad "4 流并发" 14)" "$(_rpad "${VS4:-测试失败}" 12)" "$(_rpad "${VR4:--}" 9)" "$(_rpad "${lp4:+${lp4}%}" 10)"
   echo
-  # 拿实测和整形值比, 给出结论而不是丢一堆数字
+  # 吞吐和整形值比, 给结论而不是丢一堆数字
   if [ -n "$VS4" ] && [ -n "$target" ] && [ "$target" -gt 0 ] 2>/dev/null; then
     local pct; pct=$(awk -v a="$VS4" -v b="$target" 'BEGIN{printf "%.0f", a*100/b}')
     if   [ "$pct" -ge 90 ] 2>/dev/null; then ok "达到整形值的 ${pct}%, 端口能力正常"
     elif [ "$pct" -ge 75 ] 2>/dev/null; then info "达到整形值的 ${pct}%, 偏低但可接受（对端可能被其他人占用）"
     else warn "只达到整形值的 ${pct}%, 建议换个对端重测"; fi
   fi
-  if [ -n "$VR4" ]; then
-    if   [ "${VR4%.*}" -le 50 ]  2>/dev/null; then ok "重传 ${VR4}, 整形工作正常"
-    elif [ "${VR4%.*}" -le 500 ] 2>/dev/null; then info "重传 ${VR4}, 略高但不影响"
-    else warn "重传 ${VR4} 偏高 —— 整形值可能设高了, 建议重跑菜单 3 重新找拐点"; fi
+  [ -n "$lp4" ] || return 0
+  # 没有整形时不能说"整形值设高了" —— 用户会被指去调一个根本不存在的东西
+  local advice
+  if [ -n "$target" ] && [ "$target" -gt 0 ] 2>/dev/null; then
+    advice="整形值可能设高了, 可以重跑菜单 3 重新找拐点"
+  else
+    advice="这台没有应用整形. 高丢包来自链路本身或未被识别的限速器, 可以跑菜单 3 试着扫一次拐点"
   fi
+  if   awk -v l="$lp4" 'BEGIN{exit !(l < 0.05)}'; then ok   "丢包 ${lp4}%, 链路干净"
+  elif awk -v l="$lp4" 'BEGIN{exit !(l < 0.5)}';  then ok   "丢包 ${lp4}%, 略高, 通常不影响"
+  elif awk -v l="$lp4" 'BEGIN{exit !(l < 1)}';    then warn "丢包 ${lp4}%, 偏高 —— ${advice}"
+  else                                                 warn "丢包 ${lp4}%, 很糟 —— ${advice}"; fi
 }
 
 cmd_verify(){
