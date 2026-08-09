@@ -2,6 +2,8 @@
 
 按每台机器实测推导的 TCP 调优工具. 不套用固定参数, 实测 BDP 与限速器拐点.
 
+本脚本由 [kylin010](https://github.com/Kylin010) 编写和维护.
+
 ## 安装
 
 ```bash
@@ -13,7 +15,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 固定版本并校验:
 
 ```bash
-V=v0.3.7
+V=v0.3.8
 curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/tcpfit.sh &&
 curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/install.sh &&
 curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/SHA256SUMS &&

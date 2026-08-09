@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.3.7"
+VERSION="0.3.8"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -1488,8 +1488,10 @@ banner(){
   echo
   _top
   _row "$(printf '  tcpfit - VPS TCP Optimization%s ' "$(_rpad "v$VERSION" 23)")" '0;32'
-  _row "  0. Exit"
+  _row "  本脚本由 kylin010 编写和维护"
+  _row "  github.com/Kylin010/tcpfit"
   _sep
+  _row "  0. Exit"
   _item 1 "一键调优" "Auto-tune (recommended)"   "~10 min"
   _item 2 "基础调优" "Base tuning only"          "~1 min"
   _item 3 "拐点测试" "Policer sweep"             "~8 min"
