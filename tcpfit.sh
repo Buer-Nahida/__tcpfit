@@ -9,7 +9,7 @@
 #   tcpfit.sh detect                        输出机器画像
 #   tcpfit.sh probe  --peer HOST            探测可用带宽(虚拟网卡读不到标称值时用)
 #   tcpfit.sh tune   [选项]                 应用基础调优
-#   tcpfit.sh sweep  --peer HOST [选项]     实测限速器拐点
+#   tcpfit.sh sweep  --peer HOST [选项]     实测限速器拐点 (-4/-6 指定协议族, 默认 -4)
 #   tcpfit.sh shape  --rate N | --off       应用/移除出向整形
 #   tcpfit.sh harden --swap 2G              加 swap（小内存机防止进程被杀）
 #   tcpfit.sh verify [--peer HOST]          验证当前状态
@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.4.5"
+VERSION="0.5.0"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -163,6 +163,75 @@ step(){ printf '\n  \033[1;36m▸ %s\033[0m\n' "$*"; }
 
 # 用 bash <(curl ...) 一条命令跑时, $0 是临时 fd, 脚本一退出就没了.
 # 这里把自己装到系统里, 以后想回滚/查状态还能找到.
+# 测速走哪个协议族. 默认 IPv4 —— 双栈机器上 v4 和 v6 到同一个对端的延迟可能差很多,
+# 实测见过同城对端 v4 0.8ms / v6 93ms, 按 v6 的 RTT 选对端会把最好的那个判成"太远".
+# 更麻烦的是 ping 和 iperf3 各自独立解析, 可能一个走 v4 一个走 v6 ——
+# 那样挑选依据和实际测量根本不是同一条链路.
+IP_FAMILY="${IP_FAMILY:--4}"
+
+# 按当前协议族把主机名解析成字面地址. bash 的 /dev/tcp 没法指定协议族,
+# 只能先解析好再连. 注意 v6 字面量不能加方括号, bash 认不了.
+#
+# -6 那支必须滤掉 ::ffff: 开头的 v4 映射地址 —— getent ahostsv6 对只有 A 记录的
+# 主机也会返回结果(如 ::ffff:20.205.243.166), 而 iperf3 -6 连这种地址还会成功.
+# 不滤的话: 用户选了 v6, 整个测试悄悄跑在 IPv4 上, 一句提示都没有.
+resolve_ip(){   # resolve_ip <主机名>
+  case "$IP_FAMILY" in
+    -6) getent ahostsv6 "$1" 2>/dev/null | awk '/STREAM/ && $1 !~ /^::ffff:/ {print $1; exit}' ;;
+    *)  getent ahostsv4 "$1" 2>/dev/null | awk '/STREAM/{print $1; exit}' ;;
+  esac
+}
+# 端口探测: 解析不出对应协议族的地址就直接算不可达
+probe_port(){   # probe_port <主机> <端口> [超时秒]
+  local ip; ip=$(resolve_ip "$1"); [ -n "$ip" ] || return 1
+  timeout "${3:-6}" bash -c "cat < /dev/null > /dev/tcp/${ip}/${2}" 2>/dev/null
+}
+
+# 对端 iperf3 实例的端口范围. Leaseweb/OVH 开 5201-5210, Clouvider 开 5200-5209 ——
+# 所以 5200 也得在表里. 放末尾: 放开头会让 16 个 Leaseweb/OVH 节点每次都先白撞一下.
+PORT_POOL="5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200"
+
+# 把首选端口排到表最前面, 其余保持原序. run_iperf 和选对端共用一份顺序.
+port_order(){   # port_order <首选端口>
+  local p out="$1"
+  for p in $PORT_POOL; do [ "$p" = "$1" ] || out="$out $p"; done
+  echo "$out"
+}
+
+# 选对端时的预检端口. 只探 5201 会出大事 —— 5201 是 iperf3 默认端口, 有机房
+# 专门封它防测速滥用. 实测过一台客户机器(Debian 13, 依赖齐全, 无本地防火墙):
+# 出站 5201 被单独封死(对 6 个不同目标 0/5), 而 5200/5202/5210/5211/6201 全是 5/5,
+# 结果 18 个节点全被判成 "port closed", 工具完全不可用, 最后那句
+# "公共测速服务器暂时都不可用" 还把责任推给了完全无辜的对端.
+PROBE_PORTS="5201 5202 5203 5200"
+PROBE_HIT=""        # 上一个探通的端口. 出站封锁对所有节点一致, 记住能省掉 17 次重复失败
+PROBE_PORT_OK=""    # probe_peer_port 的结果
+
+# 不能用 $(...) 取结果 —— 命令替换是子 shell, PROBE_HIT 记不住, 缓存就失效了.
+probe_peer_port(){  # probe_peer_port <主机>  -> 成功则 PROBE_PORT_OK=端口
+  local try seen=""
+  PROBE_PORT_OK=""
+  for try in $PROBE_HIT $PROBE_PORTS; do
+    case " $seen " in *" $try "*) continue ;; esac      # PROBE_HIT 可能和表里重复
+    seen="$seen $try"
+    probe_port "$1" "$try" 4 || continue
+    PROBE_HIT="$try"; PROBE_PORT_OK="$try"; return 0
+  done
+  return 1
+}
+
+# 本机有没有可用的 IPv4 出网能力. 纯 v6 机器要自动走 v6, 不能傻等 v4 超时.
+have_ipv4(){
+  ip -4 route show default 2>/dev/null | grep -q . || return 1
+  ip -4 addr show scope global 2>/dev/null | grep -q 'inet ' || return 1
+}
+
+# 本机有没有可用的 IPv6 出网能力. 光有地址不算 —— 很多机器配了 v6 地址但没路由.
+have_ipv6(){
+  ip -6 route show default 2>/dev/null | grep -q . || return 1
+  ip -6 addr show scope global 2>/dev/null | grep -q 'inet6' || return 1
+}
+
 PEER_PORT="${PEER_PORT:-5201}"   # 选定对端时确定的可用端口
 WIZARD=0                         # 一键流程内为 1：子命令只输出执行日志, 收尾统一由 wizard 打印
 # 装成不带扩展名的 tcpfit, 放 /usr/local/bin —— 用户敲 `tcpfit` 就能进菜单.
@@ -268,7 +337,7 @@ detect_rtt(){
   local targets="${NETTUNE_RTT_TARGETS:-119.29.29.29 180.76.76.76 202.96.128.86 1.2.4.8 101.226.4.6}"
   local vals=() t r
   for t in $targets; do
-    r=$(ping -c 3 -q -W 2 "$t" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
+    r=$(ping $IP_FAMILY -c 3 -q -W 2 "$t" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
     [ -n "$r" ] && vals+=("$r")
   done
   [ ${#vals[@]} -eq 0 ] && { echo ""; return; }
@@ -949,17 +1018,15 @@ cmd_probe(){
 # 拐点 = 重传开始跳变的那一档；取前一档再退安全余量.
 # NETTUNE_VERBOSE=1 时把 iperf3 原始输出打到 stderr, 让用户看到测速在跑
 # $1=peer $2=dur $3=parallel [$4=port]  -> "goodput retrans"
-# 公共节点开 5201-5210 十个实例, 指定端口忙时自动换 —— 否则单端口一忙就整个失败.
+# 公共节点各开十个实例（Leaseweb/OVH 5201-5210, Clouvider 5200-5209）,
+# 指定端口忙时自动换 —— 否则单端口一忙就整个失败. 端口表见 PORT_POOL.
 run_iperf(){
   local out raw tmp port ports pid first="${4:-${PEER_PORT:-5201}}"
-  ports="$first"
-  for p in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210; do
-    [ "$p" = "$first" ] || ports="$ports $p"
-  done
+  ports=$(port_order "$first")
   tmp=$(mktemp)
   for port in $ports; do
     : > "$tmp"
-    timeout $TIMEOUT_FG $(( $2 + 25 )) iperf3 -c "$1" -p "$port" -t "$2" -P "$3" -f m >"$tmp" 2>&1 &
+    timeout $TIMEOUT_FG $(( $2 + 25 )) iperf3 $IP_FAMILY -c "$1" -p "$port" -t "$2" -P "$3" -f m >"$tmp" 2>&1 &
     pid=$!
     # --foreground 是必须的: timeout 默认把子进程放进【独立进程组】(方便超时时杀整组),
     # 结果 Ctrl-C 发给脚本进程组的 SIGINT 根本到不了 iperf3, 它会继续满速跑到
@@ -1010,6 +1077,8 @@ cmd_sweep(){
     case "$1" in
       --peer) peer="$2"; shift 2 ;;
       --port) PEER_PORT="$2"; shift 2 ;;
+      -4) IP_FAMILY="-4"; shift ;;
+      -6) IP_FAMILY="-6"; shift ;;
       --nominal) nominal="$2"; shift 2 ;;
       --from) lo="$2"; shift 2 ;;
       --to) hi="$2"; shift 2 ;;
@@ -1364,7 +1433,7 @@ cmd_verify(){
     warn "没有可用对端, 只显示配置"
     cmd_status; return 0
   fi
-  peer_rtt=$(ping -c 2 -q -W 2 "$peer" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
+  peer_rtt=$(ping $IP_FAMILY -c 2 -q -W 2 "$peer" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
   printf "  对端    %s   RTT %sms   端口 %s\n" "$peer" "${peer_rtt:-?}" "$PEER_PORT"
   printf "  整形    %s\n" "${shaper:-未设置}"
   echo
@@ -1469,7 +1538,7 @@ auto_pick_peer(){
   tmpd=$(mktemp -d)
   while IFS='|' read -r cand name prov; do
     [ -z "$cand" ] && continue
-    ( r=$(ping -c 2 -q -W 2 "$cand" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
+    ( r=$(ping $IP_FAMILY -c 2 -q -W 2 "$cand" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
       [ -n "$r" ] && echo "$r $cand $name $prov" > "$tmpd/$cand" ) &
   done <<< "$PEER_POOL"
   wait
@@ -1491,21 +1560,25 @@ auto_pick_peer(){
     fi
     printf '  %-34s %-10s %-10s RTT %-6s ' "$cand" "$name" "$prov" "${rtt}ms" >&2
     # 先探端口, 把"根本不跑 iperf3/被墙"和"跑着但占线"分开 ——
-    # 早期两者都报"占线", 用户完全看不出真实原因
-    if ! timeout $TIMEOUT_FG 6 bash -c "cat < /dev/null > /dev/tcp/$cand/5201" 2>/dev/null; then
-      echo "port closed" >&2; continue
+    # 早期两者都报"占线", 用户完全看不出真实原因.
+    # 必须轮换: 只探 5201 的话, 出站封了 5201 的机房上所有节点都会被误判(见 PROBE_PORTS).
+    if ! probe_peer_port "$cand"; then
+      echo "port closed (tried $PROBE_PORTS)" >&2; continue
     fi
+    local pport="$PROBE_PORT_OK"
+    [ "$pport" = 5201 ] || printf '%s ' "$(_c '0;33' "5201→$pport")" >&2
     # 没装 iperf3 时无法做占线探测（iperf3 要等确认之后才装）,
     # 降级成"端口通就算可用". 选错了也不致命 —— run_iperf 本身会换端口重试.
     if ! command -v iperf3 >/dev/null 2>&1; then
-      printf '  %-34s %-10s %-10s RTT %-6s %s\n' "$cand" "$name" "$prov" "${rtt}ms" "$(_c '0;32' 'reachable (port 5201)')" >&2
-      echo "$cand:5201"; return 0
+      printf '%s\n' "$(_c '0;32' "reachable (port $pport)")" >&2
+      echo "$cand:$pport"; return 0
     fi
-    # 这些公共节点都开 5201-5210 十个 iperf3 实例（公共列表里标的就是端口范围）.
+    # 这些公共节点都开十个 iperf3 实例（公共列表里标的就是端口范围）.
     # 早期只试 5201, 等于放着 9 个空闲实例不用去跟全世界抢一个, 动不动就"占线".
+    # 从预检探通的那个端口起试 —— 5201 被封时能省掉一次 25 秒的超时等待.
     local gp="" try
-    for try in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210; do
-      if timeout $TIMEOUT_FG 25 iperf3 -c "$cand" -p "$try" -t 3 -P 1 >/dev/null 2>&1; then gp="$try"; break; fi
+    for try in $(port_order "$pport"); do
+      if timeout $TIMEOUT_FG 25 iperf3 $IP_FAMILY -c "$cand" -p "$try" -t 3 -P 1 >/dev/null 2>&1; then gp="$try"; break; fi
     done
     if [ -n "$gp" ]; then
       if [ "$rtt" -le "$ideal" ] 2>/dev/null; then
@@ -1514,7 +1587,7 @@ auto_pick_peer(){
       echo "available (port $gp, distant — held as fallback)" >&2
       [ -z "$fallback" ] && { fallback="$cand:$gp"; fallback_rtt="$rtt"; }
     else
-      echo "all 10 ports busy" >&2
+      echo "all $(echo $PORT_POOL | wc -w) ports busy" >&2
     fi
     sleep 2
   done <<< "$(echo "$sorted" | sort -n)"
@@ -1650,6 +1723,27 @@ wizard(){
   echo "      $(_c '1' "$SNAPSHOT")"
   echo "  包含拥塞控制、全部缓冲区参数、qdisc、路由等原始值."
 
+  # 协议族: 默认 IPv4; 纯 v6 机器自动走 v6; 双栈才问.
+  echo "  测速默认走 IPv4. 检测不到 IPv4 会走 IPv6."
+  if ! have_ipv4; then
+    IP_FAMILY="-6"
+    ok "本机没有 IPv4, 测速走 IPv6"
+  elif have_ipv6; then
+    echo
+    echo "  检测到本机有 IPv6.（默认走 IPv4）"
+    echo
+    local fam
+    while true; do
+      fam=$(ask "  用 v4 还是 v6？（回车 = v4）" "v4")
+      case "$fam" in
+        v4|V4|4) IP_FAMILY="-4"; break ;;
+        v6|V6|6) IP_FAMILY="-6"; break ;;
+        *) warn "  请输入 v4 或 v6" ;;
+      esac
+    done
+    ok "测速走 IPv${IP_FAMILY#-}"
+  fi
+
   # iperf3 单独放在最前面确认 —— 两个原因:
   #   1) 装包是会改系统的操作, 不该在用户点头之前做
   #   2) 选对端那一步要用 iperf3 做占线探测, 所以必须在三个问题之前就位
@@ -1755,7 +1849,7 @@ wizard(){
     # 手填的对端当场验一次可达性. 打错 IP 的话不该等到执行阶段才发现 ——
     # 那时前面三个问题都白填了, 而且已经改过 sysctl.
     printf '    检查 %s:%s … ' "$peer" "$PEER_PORT" >&2
-    if timeout 6 bash -c "cat < /dev/null > /dev/tcp/${peer}/${PEER_PORT}" 2>/dev/null; then
+    if probe_port "$peer" "$PEER_PORT" 6; then
       printf '%s\n' "$(_c '0;32' '可达')" >&2
       break
     fi
