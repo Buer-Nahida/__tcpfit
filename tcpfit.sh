@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -1448,6 +1448,10 @@ cmd_verify(){
 cmd_update(){
   need_root
   command -v curl >/dev/null || die "需要 curl"
+  # 菜单调进来时带 --from-menu: 更新完要用新版本 exec 掉自己, 否则用户在同一个
+  # 菜单里接着操作, 跑的仍是内存里的旧代码.
+  local from_menu=0
+  [ "${1:-}" = "--from-menu" ] && { from_menu=1; shift; }
   info "检查更新…"
   local latest
   # 只看 release, 不看 main —— main 可能领先于任何已发布版本
@@ -1486,10 +1490,25 @@ cmd_update(){
   if ! { head -1 "$dl/tcpfit.sh" | grep -q '^#!' && grep -q "^VERSION=\"$latest\"" "$dl/tcpfit.sh"; }; then
     rm -rf "$dl"; die "下载的文件校验不通过, 未更新" 2
   fi
-  install -m 755 "$dl/tcpfit.sh" "$SELF_PATH"
+  # 不能原地覆盖 —— 正在执行的就是 $SELF_PATH, 而 bash 是按文件偏移增量读脚本的,
+  # 原地改写有可能让它读到新文件的错位内容（两个版本长度还不一样）.
+  # 先写同目录的 .new 再 mv: rename 是原子的, 换新 inode, 旧 inode 对当前进程保持有效.
+  if ! install -m 755 "$dl/tcpfit.sh" "${SELF_PATH}.new" || ! mv -f "${SELF_PATH}.new" "$SELF_PATH"; then
+    rm -f "${SELF_PATH}.new"; rm -rf "$dl"; die "写入 $SELF_PATH 失败" 2
+  fi
   rm -rf "$dl"
   ok "已更新到 v$latest"
-  info "配置和快照不受影响. 想让新版参数生效, 重跑一次调优."
+  info "配置和快照不受影响."
+
+  # 关键: 磁盘上换了, 但当前进程内存里跑的还是旧代码.
+  # 早期版本这里只打一句"重跑一次调优", 用户就在同一个菜单里按 1 —— 跑的仍是旧版本,
+  # 于是"更新了但 bug 还在". 有客户真踩过, 排查了很久才定位到是这里.
+  if [ "$from_menu" = 1 ]; then
+    info "以新版本重启…"
+    echo
+    exec "$SELF_PATH" menu
+  fi
+  warn "当前进程跑的仍是 v${VERSION} 的代码, 重新运行 tcpfit 才会用上新版本."
 }
 
 # ── 交互式菜单 ──────────────────────────────────────────────────────────────
@@ -2078,7 +2097,7 @@ menu_loop(){
       5) cmd_status ;;
       6) local p; if p=$(auto_pick_peer); then PEER_PORT="${p##*:}"; cmd_verify --peer "${p%:*}"; else cmd_verify; fi ;;
       7) confirm "  确定回滚全部改动？" && cmd_rollback ;;
-      8) cmd_update ;;
+      8) cmd_update --from-menu ;;
       0) exit 0 ;;
       *) warn "Invalid selection" ;;
     esac
