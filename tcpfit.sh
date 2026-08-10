@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.2"
+VERSION="0.5.3"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -341,29 +341,31 @@ detect_iface(){
 # 纯 v6 机器上这里返回空, 调用方的 [ -n "$gw" ] 会跳过 initcwnd —— 安全降级.
 detect_gw(){    ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
 
-# 到国内的 RTT 中位数.
-# 关键：不能用 223.5.5.5（阿里 DNS）—— 它是 anycast, 全球有节点,
-# 在圣何塞的机器上实测只有 2.7ms, 而同机到腾讯/百度 DNS 是 157-164ms.
-# 混进 anycast 目标会让 BDP 算小几十倍, 缓冲区完全不够.
-# 下列目标已在美西机器上逐个验证为真·国内（124-164ms, 无 anycast 迹象）.
+# 算 BDP 用的 RTT. 固定 150ms, 不再探测.  用 --rtt 可以覆盖.
 #
-# ⚠ 这里的 ping 【不能】带 $IP_FAMILY.
-# 量的是"到国内的 RTT", 用来算 BDP 和缓冲区 —— 那是这台机器【真实业务流量】的属性,
-# 跟"测速挑了哪个协议族"没有关系. 双栈机器上用户选 v6 只是为了测对端,
-# 业务可能还走 v4, 缓冲区就该按 v4 的 RTT 算.
-# v0.5.0/0.5.1 这里错加了 $IP_FAMILY: 目标全是 v4 字面量, -6 下 ping 直接报
-# "Address family for hostname not supported" → detect_rtt 返回空 → cmd_tune 撞
-# die "无法确定 RTT". 双栈机器只要选 v6 就必崩.
-detect_rtt(){
-  local targets="${NETTUNE_RTT_TARGETS:-119.29.29.29 180.76.76.76 202.96.128.86 1.2.4.8 101.226.4.6}"
-  local vals=() t r
-  for t in $targets; do
-    r=$(ping -c 3 -q -W 2 "$t" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
-    [ -n "$r" ] && vals+=("$r")
-  done
-  [ ${#vals[@]} -eq 0 ] && { echo ""; return; }
-  printf '%s\n' "${vals[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'
-}
+# 为什么不测了 —— 旧做法是 ping 五个国内 DNS 取中位数, 三个问题让它没法用:
+#
+#  1. anycast 污染. 五个目标里腾讯/百度/CNNIC 三个是 anycast, 会命中就近节点.
+#     本机(香港)实测: 2ms / 1ms / 1ms, 而真·国内是 138-145ms —— 中位数取出 2ms,
+#     差 70 倍. 更糟的是 BDP 算小之后缓冲区落到 4MB 下限, 而 4MB 正好等于
+#     Linux 出厂值, 等于"调了个寂寞", 还打印一份看着完全正常的推导过程.
+#  2. 硬依赖 ping + ICMP. 精简镜像不带 iputils-ping, 有的机房挡 ICMP ——
+#     两种情况都让 detect_rtt 返回空, 然后 die "无法确定 RTT, 请用 --rtt 指定",
+#     而向导里根本没地方填这个参数, 报错把用户指向死路. 客户真踩过.
+#  3. 就算测准了也没意义. "到中国的 RTT"不是一个数: 同一台机器同一时刻实测
+#     移动 55ms / 联通 93ms / 电信 138ms / 上海电信 145ms, 差 2.6 倍,
+#     再叠加晚高峰. 测出来的只是这个分布里随机的一个点.
+#
+# 为什么是 150 —— 缓冲区是 2×BDP, 所以估 E 能【全速覆盖到 2E】的目的地:
+#     估 150 → 覆盖 ≤300ms. 大陆用户的全部场景都在里面:
+#     优化线 40-70ms / 香港普通线 145ms / 美西 160-180ms / 欧美 230-250ms /
+#     晚高峰拥塞 300ms —— 全部 100%.
+# 再高没有收益: 200/300 多出来的覆盖(400/600ms)现实中用不上, 而且
+#     小内存机器早被 RAM/32 封顶接住(512MB→16MB), 估多高结果都一样;
+#     大机器上则要多付 BBR 超发的账 —— 实测超配 215 倍时掉 22% 吞吐.
+# 估低才是真危险: 估 40 时只覆盖 80ms, 2G 口到美西只剩 941 Mbps(47%),
+#     而且是硬天花板, 用户怎么测都上不去还查不出原因.
+DEFAULT_RTT=150
 
 detect_ram_mb(){ awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo; }
 detect_cores(){  nproc 2>/dev/null || echo 1; }
@@ -378,7 +380,7 @@ detect_link_mbps(){
 cmd_detect(){
   local iface rtt ram cores link virt kern cc_avail queues
   iface=$(detect_iface); [ -n "$iface" ] || die "找不到默认路由网卡"
-  rtt=$(detect_rtt); ram=$(detect_ram_mb); cores=$(detect_cores)
+  rtt="$DEFAULT_RTT"; ram=$(detect_ram_mb); cores=$(detect_cores)
   link=$(detect_link_mbps "$iface")
   # systemd-detect-virt 在裸机上输出 none 但退出码为 1, 不能用 || 兜底
   virt=$(systemd-detect-virt 2>/dev/null); [ -n "$virt" ] || virt=unknown
@@ -395,7 +397,7 @@ cmd_detect(){
   kv "Virt"        "$virt"
   kv "CPU cores"   "$cores"
   kv "Memory MB"   "$ram"
-  kv "RTT to CN"   "${rtt:-probe failed}"
+  kv "RTT (assumed)" "${rtt}ms  — 固定值, 覆盖到 ${rtt}x2=$((rtt*2))ms 的路径; 要改用 tune --rtt"
   kv "CC available" "$cc_avail"
   kv "BBR"         "$(echo "$cc_avail" | grep -qw bbr && echo 是 || (modprobe tcp_bbr 2>/dev/null && echo '是(需加载模块)' || echo 否))"
 
@@ -656,8 +658,13 @@ cmd_tune(){
 
   local iface ram; iface=$(detect_iface); ram=$(detect_ram_mb)
   [ -n "$iface" ] || die "找不到默认路由网卡"
-  [ -n "$rtt" ] || rtt=$(detect_rtt)
-  [ -n "$rtt" ] && [ "$rtt" -gt 0 ] 2>/dev/null || die "无法确定 RTT, 请用 --rtt 指定"
+  # --rtt 给了就用给的, 没给就用固定值. 不再探测, 所以不会再出现
+  # "无法确定 RTT" 这种把用户指向死路的报错（向导里根本没地方填 --rtt）.
+  if [ -n "$rtt" ]; then
+    is_posint "$rtt" 1 2000 || die "--rtt 必须是 1-2000 之间的整数（毫秒）"
+  else
+    rtt="$DEFAULT_RTT"
+  fi
   # --bw auto: 现场探测. 虚拟网卡读不到标称速率, 这是最常见的情况.
   if [ "$bw" = auto ]; then
     [ -n "$peer" ] || die "--bw auto 需要同时给 --peer <近处的iperf3服务器>"
