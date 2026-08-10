@@ -12,17 +12,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 
 跑完直接出菜单, 选 1 全自动. 脚本会装到 `/usr/local/bin/tcpfit`, 以后敲 `tcpfit` 即可.
 
-固定版本并校验:
-
-```bash
-V=v0.3.8
-curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/tcpfit.sh &&
-curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/install.sh &&
-curl -fsSLO https://github.com/Kylin010/tcpfit/releases/download/$V/SHA256SUMS &&
-sha256sum -c SHA256SUMS &&
-bash tcpfit.sh
-```
-
 ## 三种用法
 
 | 用法 | 命令 |
