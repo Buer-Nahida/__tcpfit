@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.1"
+VERSION="0.5.2"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -325,19 +325,40 @@ migrate_legacy(){
 }
 
 # ── 环境检测 ────────────────────────────────────────────────────────────────
-detect_iface(){ ip route show default 2>/dev/null | awk '{print $5; exit}'; }
-detect_gw(){    ip route show default 2>/dev/null | awk '{print $3; exit}'; }
+# 默认路由网卡. 【不跟 $IP_FAMILY 走】—— 网卡是物理概念, 整形和 qdisc 打在同一张卡上,
+# 选 v4 还是 v6 测速都是它. 只是纯 v6 机器的 v4 路由表是空的, 所以 v4 查不到时回退查 v6.
+# (`ip route` 等价于 `ip -4 route`, 早期版本只写这一句, 纯 v6 机器直接
+#  die "找不到默认路由网卡", 从来就没跑起来过.)
+detect_iface(){
+  local i
+  i=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+  [ -n "$i" ] || i=$(ip -6 route show default 2>/dev/null | awk '{print $5; exit}')
+  echo "$i"
+}
+# 网关【只取 v4】. 它唯一的用途是 `ip route replace default via $gw ...`(设 initcwnd),
+# 那是 IPv4 路由表操作, 喂 v6 地址进去会直接报
+# "Error: inet address is expected rather than 2a0f:...". 实测验证过.
+# 纯 v6 机器上这里返回空, 调用方的 [ -n "$gw" ] 会跳过 initcwnd —— 安全降级.
+detect_gw(){    ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
 
 # 到国内的 RTT 中位数.
 # 关键：不能用 223.5.5.5（阿里 DNS）—— 它是 anycast, 全球有节点,
 # 在圣何塞的机器上实测只有 2.7ms, 而同机到腾讯/百度 DNS 是 157-164ms.
 # 混进 anycast 目标会让 BDP 算小几十倍, 缓冲区完全不够.
 # 下列目标已在美西机器上逐个验证为真·国内（124-164ms, 无 anycast 迹象）.
+#
+# ⚠ 这里的 ping 【不能】带 $IP_FAMILY.
+# 量的是"到国内的 RTT", 用来算 BDP 和缓冲区 —— 那是这台机器【真实业务流量】的属性,
+# 跟"测速挑了哪个协议族"没有关系. 双栈机器上用户选 v6 只是为了测对端,
+# 业务可能还走 v4, 缓冲区就该按 v4 的 RTT 算.
+# v0.5.0/0.5.1 这里错加了 $IP_FAMILY: 目标全是 v4 字面量, -6 下 ping 直接报
+# "Address family for hostname not supported" → detect_rtt 返回空 → cmd_tune 撞
+# die "无法确定 RTT". 双栈机器只要选 v6 就必崩.
 detect_rtt(){
   local targets="${NETTUNE_RTT_TARGETS:-119.29.29.29 180.76.76.76 202.96.128.86 1.2.4.8 101.226.4.6}"
   local vals=() t r
   for t in $targets; do
-    r=$(ping $IP_FAMILY -c 3 -q -W 2 "$t" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
+    r=$(ping -c 3 -q -W 2 "$t" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
     [ -n "$r" ] && vals+=("$r")
   done
   [ ${#vals[@]} -eq 0 ] && { echo ""; return; }
@@ -1743,13 +1764,17 @@ wizard(){
   echo "  包含拥塞控制、全部缓冲区参数、qdisc、路由等原始值."
 
   # 协议族: 默认 IPv4; 纯 v6 机器自动走 v6; 双栈才问.
-  echo "  测速默认走 IPv4. 检测不到 IPv4 会走 IPv6."
+  # 每个分支只说跟这台机器有关的话.
+  # 早期版本在这里无条件打一句"测速默认走 IPv4. 检测不到 IPv4 会走 IPv6." ——
+  # 本意是说明规则, 但纯 v4 机器(绝大多数)看到的就只有这一行, 而且没有任何一行
+  # 确认"检测到了 v4". tcpfit 其他输出全是状态行, 用户就把"检测不到 IPv4"
+  # 读成了对自己机器的判定, 以为脚本认错了. 有用户真这么报过.
   if ! have_ipv4; then
     IP_FAMILY="-6"
     ok "本机没有 IPv4, 测速走 IPv6"
   elif have_ipv6; then
     echo
-    echo "  检测到本机有 IPv6.（默认走 IPv4）"
+    echo "  本机是 IPv4 + IPv6 双栈, 测速默认走 IPv4."
     echo
     local fam
     while true; do
@@ -1863,8 +1888,24 @@ wizard(){
       peer="${picked%:*}"; PEER_PORT="${picked##*:}"
       break
     fi
+    # 拆主机和端口. 不能只按"最后一个冒号"拆 —— IPv6 地址本身满是冒号:
+    #   2001:db8::1  会被拆成 主机=2001:db8: 端口=1, 然后拿着错主机错端口继续跑, 静默出错.
+    # 五种形式都要认（不能只收带端口的, 界面上就是教用户填 1.2.3.4 这种裸地址）:
+    #   1.2.3.4 / example.com        → 默认 5201
+    #   1.2.3.4:5202 / host:5202     → 拆
+    #   2001:db8::1                  → 裸 v6, 默认 5201
+    #   [2001:db8::1]:5202           → 剥方括号再拆
+    # 顺序有讲究: [v6]:port 必须排在 [v6] 前面, 裸 v6 (两个以上冒号) 必须排在 host:port 前面.
     PEER_PORT=5201
-    case "$peer" in *:*) PEER_PORT="${peer##*:}"; peer="${peer%:*}" ;; esac
+    case "$peer" in
+      \[*\]:*) PEER_PORT="${peer##*]:}"; peer="${peer%%]:*}"; peer="${peer#\[}" ;;
+      \[*\])   peer="${peer#\[}"; peer="${peer%\]}" ;;
+      *:*:*)   : ;;
+      *:*)     PEER_PORT="${peer##*:}"; peer="${peer%:*}" ;;
+    esac
+    if ! is_posint "$PEER_PORT" 1 65535; then
+      warn "端口必须是 1-65535 之间的整数（IPv6 地址请写成 [地址]:端口）"; echo; continue
+    fi
     # 手填的对端当场验一次可达性. 打错 IP 的话不该等到执行阶段才发现 ——
     # 那时前面三个问题都白填了, 而且已经改过 sysctl.
     printf '    检查 %s:%s … ' "$peer" "$PEER_PORT" >&2
