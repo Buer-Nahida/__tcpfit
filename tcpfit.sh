@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.3"
+VERSION="0.5.4"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -220,16 +220,78 @@ probe_peer_port(){  # probe_peer_port <主机>  -> 成功则 PROBE_PORT_OK=端�
   return 1
 }
 
+# ⚠ 本文件顶部是 `set -uo pipefail`, 所以【绝对不能写 `命令 | grep -q 模式`】.
+# grep -q 一匹配就立刻退出并关掉管道, 写端还没写完就吃 SIGPIPE 死掉,
+# pipefail 把 141 当成整条管道的返回值 —— 于是"匹配到了"被读成"没匹配到".
+# 只要匹配点之后还有内容要写就会触发. 2026-08-11 客户机实测:
+#   ip -4 addr show scope global | grep -q 'inet '   →  292/300 返回 141
+# 那台装了 docker, eth0 后面还跟着 docker0; 没有 docker 的机器 eth0 就是最后一个,
+# ip 写完了 grep 才退出, 于是永远不复现 —— 同款机器一台好一台坏, 全卡在这里.
+# 统一改成命令替换 + case: 读到 EOF, 写端永远不会被打断.
+has_str(){  case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+starts_with(){ case "$1" in "$2"*) return 0 ;; *) return 1 ;; esac; }   # 等价 grep -q '^…'
+# 等价 grep -qw: 匹配处前后都不能是单词字符. 不能简单按空格切 ——
+# 实测 "reno,cubic,bbr" 和 tab 分隔的列表 grep -qw 都算命中, 按空格切会漏判.
+has_word(){ case "$1" in
+    "$2"|"$2"[!A-Za-z0-9_]*|*[!A-Za-z0-9_]"$2"|*[!A-Za-z0-9_]"$2"[!A-Za-z0-9_]*) return 0 ;;
+    *) return 1 ;; esac; }
+# 等价 grep -q . : 只要有【任意非换行字符】就算有内容. 用 [![:space:]] 会把
+# 纯空格的输出判成空, 和原来的行为不一致.
+not_blank(){ case "$1" in *[!$'\n']*) return 0 ;; *) return 1 ;; esac; }
+# 取第一行, 空则给默认值. 不用 `| head -1 || 默认值` —— head 读够一行就退出,
+# 写端(grep)还有匹配要输出时被 SIGPIPE 打死, pipefail 返回 141, `||` 于是误触发,
+# 结果是「真值 + 默认值」一起打出来.
+first_or(){ local s="${1%%$'\n'*}"; if [ -n "$s" ]; then printf '%s' "$s"; else printf '%s' "$2"; fi; }
+
+# tc 显示速率时【只在除得尽的时候才换单位】. 2026-08-11 两台机器实测 (iproute2 5.15):
+#   999→999Mbit  1000→1Gbit  1001→1001Mbit  1500→1500Mbit
+#   2000→2Gbit   2500→2500Mbit  3000→3Gbit  5000→5Gbit  9171→9171Mbit  10000→10Gbit
+# 所以 "2.5Gbit"/"9.171Gbit" 这种带小数的显示【不会出现】——
+# 曾经的注释和一份 review 都这么写过, 是错的, 别再照抄.
+# 真正会踩坑的是【整千值】: 1000/2000/3000/5000/10000, 它们显示成 "NGbit".
+# 所有读取整形值的地方都必须走这个函数, 不许各写各的正则. 早期 status / verify /
+# banner / 向导结果四处各写死 'rate [0-9]+[MKG]bit' + "${shaper%Mbit}", 后果是
+# "1Gbit" 剥不掉 "Gbit" → 当成非数字 → 达成率判断被跳过, 还反过来提示
+# "这台没有应用整形"（`tcpfit shape --rate 1000` 对 1G 口是最自然的手输值）.
+# 小数分支保留是为了防御: 换个 tc 版本万一真打出小数, 这里也算得对.
+# 返回 Mbit 数字; 没有整形时返回空并且退出码非 0.
+tc_rate_mbit(){   # tc_rate_mbit "<tc class show 的输出>"
+  local r
+  r=$(grep -oE 'rate [0-9.]+[KMGTkmgt]?bit' <<<"${1:-}")
+  r=${r%%$'\n'*}          # 只要第一条; 不用 `| head -1`, 见上面 SIGPIPE 那段注释
+  r=${r#rate }
+  [ -n "$r" ] || return 1
+  awk -v s="$r" 'BEGIN{
+    u = s; sub(/^[0-9.]+/, "", u); sub(/bit$/, "", u)
+    v = s + 0
+    if      (u == "K" || u == "k") v = v/1000
+    else if (u == "G" || u == "g") v = v*1000
+    else if (u == "T" || u == "t") v = v*1000000
+    else if (u == "")              v = v/1000000
+    if (v == int(v)) printf "%d", v; else printf "%g", v }'
+}
+
 # 本机有没有可用的 IPv4 出网能力. 纯 v6 机器要自动走 v6, 不能傻等 v4 超时.
 have_ipv4(){
-  ip -4 route show default 2>/dev/null | grep -q . || return 1
-  ip -4 addr show scope global 2>/dev/null | grep -q 'inet ' || return 1
+  local rt ad
+  rt=$(ip -4 route show default 2>/dev/null)
+  ad=$(ip -4 addr show scope global 2>/dev/null)
+  not_blank "$rt" && has_str "$ad" 'inet ' && return 0
+  # 默认路由不一定叫 "default". 机器上跑着 VPN/透明代理(WireGuard、sing-box、Clash TUN)时,
+  # 全局路由常被拆成 0.0.0.0/1 + 128.0.0.0/1, 或整个挪进策略路由的独立表 ——
+  # 这两种情况 `route show default` 都是空的, 而机器的 v4 明明是通的.
+  # `route get` 走内核真正的选路逻辑, 拆分路由和策略表都算数; 输出里有 src
+  # 就说明既选得出出口、也有全局源地址, 一次覆盖原来那两个条件.
+  has_str "$(ip -4 route get 1.1.1.1 2>/dev/null)" ' src '
 }
 
 # 本机有没有可用的 IPv6 出网能力. 光有地址不算 —— 很多机器配了 v6 地址但没路由.
 have_ipv6(){
-  ip -6 route show default 2>/dev/null | grep -q . || return 1
-  ip -6 addr show scope global 2>/dev/null | grep -q 'inet6' || return 1
+  local rt ad
+  rt=$(ip -6 route show default 2>/dev/null)
+  ad=$(ip -6 addr show scope global 2>/dev/null)
+  not_blank "$rt" && has_str "$ad" 'inet6' && return 0
+  has_str "$(ip -6 route get 2606:4700:4700::1111 2>/dev/null)" ' src '
 }
 
 PEER_PORT="${PEER_PORT:-5201}"   # 选定对端时确定的可用端口
@@ -264,7 +326,7 @@ self_install(){
   command -v curl >/dev/null || return 0
   curl -fsSL "$SELF_URL" -o "$SELF_PATH".tmp 2>/dev/null || return 0
   # 校验版本一致. 开发期 main 领先 tag 时这里会失败, 跳过安装也是对的.
-  if [ -s "$SELF_PATH".tmp ] && head -1 "$SELF_PATH".tmp | grep -q '^#!' \
+  if [ -s "$SELF_PATH".tmp ] && starts_with "$(head -1 "$SELF_PATH".tmp 2>/dev/null)" '#!' \
      && grep -q "^VERSION=\"$VERSION\"" "$SELF_PATH".tmp; then
     mv "$SELF_PATH".tmp "$SELF_PATH"; chmod +x "$SELF_PATH"
     rm -f "$LEGACY_SELF"                      # 清掉旧位置, 免得两份不同版本并存
@@ -399,7 +461,7 @@ cmd_detect(){
   kv "Memory MB"   "$ram"
   kv "RTT (assumed)" "${rtt}ms  — 固定值, 覆盖到 ${rtt}x2=$((rtt*2))ms 的路径; 要改用 tune --rtt"
   kv "CC available" "$cc_avail"
-  kv "BBR"         "$(echo "$cc_avail" | grep -qw bbr && echo 是 || (modprobe tcp_bbr 2>/dev/null && echo '是(需加载模块)' || echo 否))"
+  kv "BBR"         "$(has_word "$cc_avail" bbr && echo 是 || (modprobe tcp_bbr 2>/dev/null && echo '是(需加载模块)' || echo 否))"
 
   mkdir -p "$STATE_DIR"
   cat > "$FACTS" <<EOF
@@ -476,9 +538,14 @@ buf_max_reason(){   # buf_max_reason <BDP字节> <内存MB> <算出的buf_max>
 # 不用百分比是因为百分比在两端都别扭 —— 100M 机器 3% 才 3Mbit 太小,
 # 2G 机器 3% 就是 60Mbit 太浪费. 分档更贴合实际.
 # 余量的意义：sweep 是在某个时刻测的, 晚高峰线路会变差, 留一点缓冲避免那时暴丢包.
+# 安全余量. 现役档位换算成比例大约都是 2-5%, 所以小带宽也按这个比例给,
+# 不能沿用"≤100M 一律 5"—— 15 Mbps 的线上 5 就是 33% 的容量, 实测干净区
+# 上限 15 时会被整形到 10, 白丢三分之一.
 calc_margin(){
   local bw="$1"
-  if   [ "$bw" -le 100 ]  2>/dev/null; then echo 5      # ≤100M   小水管, 5 就够
+  if   [ "$bw" -le 30 ]   2>/dev/null; then echo 1      # ≤30M    5 就是三分之一, 只能给 1
+  elif [ "$bw" -le 60 ]   2>/dev/null; then echo 2      # 31-60M
+  elif [ "$bw" -le 100 ]  2>/dev/null; then echo 5      # 61-100M  原档位
   elif [ "$bw" -le 300 ]  2>/dev/null; then echo 10     # 101-300M
   elif [ "$bw" -le 600 ]  2>/dev/null; then echo 15     # 301-600M  最常见档位
   elif [ "$bw" -le 1000 ] 2>/dev/null; then echo 25     # 601-1000M
@@ -699,7 +766,7 @@ cmd_tune(){
   modprobe tcp_bbr 2>/dev/null
   echo tcp_bbr > /etc/modules-load.d/tcpfit-bbr.conf
   local cc=bbr
-  sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr || {
+  has_word "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)" bbr || {
     warn "kernel has no BBR, falling back to cubic (much smaller gain)"; cc=cubic; }
 
   cat > "$SYSCTL_FILE" <<EOF
@@ -790,7 +857,7 @@ H
   echo "  $(disp) sweep --peer <近处的iperf3服务器> --nominal $bw"
 
   # 小内存机不加 swap 就是定时炸弹：实测过 tcp_mem 撑爆内存把代理进程连杀 7 次
-  if [ "$ram" -le 1024 ] && ! swapon --show 2>/dev/null | grep -q .; then
+  if [ "$ram" -le 1024 ] && ! not_blank "$(swapon --show 2>/dev/null)"; then
     echo
     warn "本机内存 ${ram}MB 且无 swap, 跑代理建议加一个：$(disp) harden --swap 2G"
   fi
@@ -822,7 +889,7 @@ cmd_harden(){
   take_snapshot        # harden 会往 $SYSCTL_FILE 追加 vm.swappiness,
                        # 不存快照的话之后跑 tune 会因"有配置无快照"直接中止
 
-  if swapon --show 2>/dev/null | grep -q .; then
+  if not_blank "$(swapon --show 2>/dev/null)"; then
     info "已有 swap, 跳过: $(free -h | awk '/Swap/{print $2}')"
     return 0
   fi
@@ -911,8 +978,17 @@ cmd_shape(){
   take_snapshot
   write_qdisc "$rate" "$iface"
   systemctl restart tcpfit-qdisc.service 2>/dev/null || "$QDISC_SCRIPT" "$rate"
-  # 事后用 tc 核对, 不能只看命令有没有报错
-  if tc class show dev "$iface" 2>/dev/null | grep -q "rate ${rate}Mbit"; then
+  # 事后用 tc 核对, 不能只看命令有没有报错.
+  # 【不能】直接 grep "rate ${rate}Mbit" —— tc 对除得尽的值会换成 Gbit 显示:
+  #   --rate 500 → "rate 500Mbit"   --rate 1000 → "rate 1Gbit"
+  #   --rate 5000 → "rate 5Gbit"    --rate 9171 → "rate 9171Mbit"(除不尽, 不换)
+  # 于是整千的整形值会匹配失败, 整形明明生效却报
+  # "shaping did not take effect" —— 而 1000/2000/10000 正是最常手输的值.
+  # 改成读回来换算成 Mbit 再比, 留 1% 容差(tc 内部按字节/秒存, 换算有舍入).
+  local applied
+  applied=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)")
+  if [ -n "$applied" ] && awk -v a="$applied" -v r="$rate" \
+       'BEGIN{exit !(a > r*0.99 && a < r*1.01)}' 2>/dev/null; then
     ok "HTB ${rate} Mbit + fq leaf pacing on ${iface}"
   else
     warn "shaping did not take effect on ${iface} -- check: tc qdisc show dev ${iface}"
@@ -959,7 +1035,7 @@ timeout --foreground 1 true >/dev/null 2>&1 && TIMEOUT_FG="--foreground"
 # 不能靠"跑一次看退出码"判断: BusyBox 不认 -g 时也返回 1, 会被误判成支持.
 # 改看帮助里有没有长选项 --pgroup —— BusyBox 压根不支持长选项.
 PKILL_G=0
-pkill --help 2>&1 | grep -q -- '--pgroup' && PKILL_G=1
+has_str "$(pkill --help 2>&1)" "--pgroup" && PKILL_G=1
 
 # 收掉本脚本起的 iperf3. 优先按进程组匹配 —— iperf3 的父进程是 timeout 不是本脚本,
 # 按 -P $$ 匹配不到. 只杀同组的, 不动用户手工跑的.
@@ -977,14 +1053,20 @@ qdisc_restore(){
   [ -n "$QSAVE_IFACE" ] || return 0
   tc qdisc del dev "$QSAVE_IFACE" root 2>/dev/null
   if [ -x "$QDISC_SCRIPT" ]; then
-    "$QDISC_SCRIPT" >/dev/null 2>&1 && { QSAVE_IFACE=""; return 0; }
+    "$QDISC_SCRIPT" >/dev/null 2>&1 && return 0   # 同理, 不清 QSAVE_IFACE
   fi
   case "$QSAVE_KIND" in
     # mq 是内核按硬件队列自动建的, 删掉 root 后它会自己回来, 不能手工 add
     ""|mq|noqueue|pfifo_fast) : ;;
     *) tc qdisc add dev "$QSAVE_IFACE" root "$QSAVE_KIND" 2>/dev/null ;;
   esac
-  QSAVE_IFACE=""
+  # ⚠ 这里【不能】清空 QSAVE_IFACE.
+  # cmd_sweep 会调它两次: 不限速探测结束后一次, 扫描全部结束后一次.
+  # 早期版本在这里清空, 于是第二次调用直接 return 0 什么都不做 ——
+  # 扫描最后一档的 HTB 就留在网卡上, 而屏幕上还打印 "qdisc restored".
+  # 实测: 香港 CN2 跑完 sweep 后机器上仍挂着 class htb rate 31Mbit.
+  # 只在"扫描跑了但没定位到拐点"时暴露（找到拐点的话后面 cmd_shape 会覆盖掉）.
+  # del + add 本身是幂等的, 重复调用无害, 所以不需要这个哨兵.
 }
 # 未知/自定义 qdisc 不是我们能原样重建的, 先问过用户
 qdisc_guard(){   # qdisc_guard <iface>
@@ -1013,10 +1095,20 @@ probe_bandwidth(){
   trap - INT TERM HUP
   qdisc_restore
   [ -n "$res" ] || { echo ""; return 1; }
-  gp=$(echo "$res" | awk '{print $1}')
-  # 取最近的 50Mbps 档. 早期版本无脑向上取整, 实测把 305Mbps 估成 350,
-  # 导致 sweep 的扫描区间整体偏高.
-  awk -v g="$gp" 'BEGIN{printf "%d", int(g/50+0.5)*50}'
+  # run_iperf 第三列是接收端实际送达量. 老版 iperf3 没给 receiver 汇总时
+  # 第三列为空, 退回使用既有的发送端数字.
+  gp=$(echo "$res" | awk '{print $3}')
+  [ -n "$gp" ] || gp=$(echo "$res" | awk '{print $1}')
+  # 取整粒度跟档位走. 早期版本无脑向上取整, 实测把 305Mbps 估成 350,
+  # 导致 sweep 的扫描区间整体偏高 —— 所以要取整.
+  # 但粒度不能一刀切 50: int(10/50+0.5)*50 = 0, 十兆小水管直接归零,
+  # 向导会打印 "Measured ~0 Mbps" 然后 die "无法确定带宽". 客户实际踩过.
+  # 归零阈值是 25 Mbps, 25-49 还会被高估最多一倍(27.8→50, 而真实容量约 15).
+  awk -v g="$gp" 'BEGIN{
+    if      (g < 50)  s = 1      # 小水管: 不取整, 差 1M 都是差
+    else if (g < 200) s = 10
+    else              s = 50     # 大机器: 保持原行为(305→300, 481→500)
+    printf "%d", int(g/s+0.5)*s }'
 }
 
 cmd_probe(){
@@ -1045,11 +1137,12 @@ cmd_probe(){
 # 平均速率没超也会被打穿. 加 fq pacing 后可以贴着真实上限跑而几乎不丢包.
 # 拐点 = 重传开始跳变的那一档；取前一档再退安全余量.
 # NETTUNE_VERBOSE=1 时把 iperf3 原始输出打到 stderr, 让用户看到测速在跑
-# $1=peer $2=dur $3=parallel [$4=port]  -> "goodput retrans"
+# $1=peer $2=dur $3=parallel [$4=port]  -> "sender_mbps retrans [receiver_mbps]"
+# 前两列是既有契约, 第三列只追加不改义；没有 receiver 汇总时仍返回两列.
 # 公共节点各开十个实例（Leaseweb/OVH 5201-5210, Clouvider 5200-5209）,
 # 指定端口忙时自动换 —— 否则单端口一忙就整个失败. 端口表见 PORT_POOL.
 run_iperf(){
-  local out raw tmp port ports pid first="${4:-${PEER_PORT:-5201}}"
+  local out recv raw tmp port ports pid sg rt rg="" first="${4:-${PEER_PORT:-5201}}"
   ports=$(port_order "$first")
   tmp=$(mktemp)
   for port in $ports; do
@@ -1074,7 +1167,12 @@ run_iperf(){
   [ "${NETTUNE_VERBOSE:-0}" = 1 ] && echo "$raw" | sed 's/^/      | /' >&2
   out=$(echo "$raw" | grep -E "$( [ "$3" -gt 1 ] && echo 'SUM.*sender' || echo 'sender' )" | tail -1)
   [ -z "$out" ] && { echo ""; return; }
-  echo "$out" | awk '{print $(NF-3), $(NF-1)}'
+  recv=$(echo "$raw" | grep -E "$( [ "$3" -gt 1 ] && echo 'SUM.*receiver' || echo 'receiver' )" | tail -1)
+  sg=$(echo "$out"  | awk '{print $(NF-3)}')
+  rt=$(echo "$out"  | awk '{print $(NF-1)}')
+  [ -n "$recv" ] && rg=$(echo "$recv" | awk '{print $(NF-2)}')
+  if [ -n "$rg" ]; then printf '%s %s %s\n' "$sg" "$rt" "$rg"
+  else                     printf '%s %s\n'    "$sg" "$rt"; fi
 }
 
 # 丢包率(%) = 重传数 / 发出的包数. 包数按 1448 字节 MSS 估算.
@@ -1203,9 +1301,10 @@ cmd_sweep(){
       fi
       # 吞吐远低于限速值、重传却很低 = 整形器压根没被触发, 瓶颈在对端.
       # 「重传低」这个条件必不可少：吞吐低但重传高是真撞限速器, 那是有效数据.
-      if awk -v g="$gp" -v r="$r" 'BEGIN{exit !(g < r*0.7)}' 2>/dev/null; then
+      if awk -v g="$gp" -v r="$r" -v l="$lp" -v t="$thresh" \
+         'BEGIN{exit !(g < r*0.7 && l <= t)}' 2>/dev/null; then
         SLOW_HITS=$(( SLOW_HITS + 1 ))
-        printf '  %-10s %12s %9s %8s  %s\n' "$r" "$gp" "$rt" \
+        printf '  %-10s %12s %9s %8s  %s\n' "$r" "$gp" "$rt" "$lp" \
           "$(_c '0;33' "only $(awk -v g="$gp" -v r="$r" 'BEGIN{printf "%d", g*100/r}')% of target")"
         [ "$SLOW_HITS" -ge 3 ] && { PEER_TOO_SLOW=1; return 0; }
         LAST_OK=$r; prev_gp=$gp; sleep "$GAP"; continue
@@ -1227,7 +1326,7 @@ cmd_sweep(){
   # 美国机不限速 1262 / 3.44%, 拐点 1340. 从不限速吞吐往下找会直接错过.
   #
   # 用单流: 多流的丢包归因不干净, 而且这个项目面向国内优化线路, 单流是实际场景.
-  local ug="" ulp=""
+  local ug="" ug_recv="" ulp=""
   if [ -z "$user_range" ]; then
     info "Unshaped probe (no rate limit, ${dur}s, 1 stream)"
     printf '  %-10s %12s %9s %8s  %s\n' "Rate/Mbit" "Goodput/Mbps" "Retrans" "Loss%" "Verdict"
@@ -1238,9 +1337,10 @@ cmd_sweep(){
     qdisc_restore
     [ -n "$ures" ] || { warn "unshaped probe failed, check the peer"; return 2; }
     ug=$(echo "$ures" | awk '{print $1}'); urt=$(echo "$ures" | awk '{print $2}')
+    ug_recv=$(echo "$ures" | awk '{print $3}')
     ulp=$(loss_pct "$urt" "$ug" "$dur")
 
-    if awk -v g="$ug" -v c="$cap" 'BEGIN{exit !(g > c)}'; then
+    if awk -v g="${ug_recv:-$ug}" -v c="$cap" 'BEGIN{exit !(g > c)}'; then
       printf '  %-10s %12s %9s %8s  %s\n' "none" "$ug" "$urt" "$ulp" "above cap"
       echo
       warn "不限速就能跑 ${ug} Mbps, 超过 ${cap} Mbit 的扫描上限."
@@ -1260,18 +1360,33 @@ cmd_sweep(){
     fi
 
     printf '  %-10s %12s %9s %8s  %s\n' "none" "$ug" "$urt" "$ulp" "$(_c '0;31' 'loss -- policer present')"
-    # 拐点在 ug 之上, 所以区间从 ug 稍下方起, 往上扫
+    # ug 是 iperf3【发送端】的数字, 它包含了"写进 socket 但没送达"的部分 ——
+    # 干净链路上和接收端只差 3%, 但丢包链路上差很多. 实测一台香港 CN2:
+    # 不限速 发送 18.3 / 接收 14.6（丢包 23.6%）, 而干净区上限只有 15.
+    # 直接拿 18.3 推区间会得到 17→31, 起点就已经在丢包区里, 整个扫描跑偏.
+    # receiver 是 iperf3 实测送达量, 比按重传率反推更准确. 极老版本没有
+    # receiver 汇总时第三列为空, 保留原公式作为兼容兜底.
+    local ug_eff="$ug_recv"
+    [ -n "$ug_eff" ] || ug_eff=$(awk -v g="$ug" -v l="$ulp" 'BEGIN{
+      v=g*(1-l/100); if(v<1)v=1; printf "%.1f", v }')
+    # 拐点在（真实送达量）之上, 所以区间从它稍下方起, 往上扫.
     # 打穿限速器后 goodput 会掉下来, 丢得越狠掉得越多, 所以上界要按丢包率放宽:
     # 24% 丢包时真实拐点可能比 1.25×goodput 高得多(群里碰到过 177Mbps/24% 的例子).
-    lo=$(awk -v g="$ug" 'BEGIN{printf "%d", g*0.95}')
-    hi=$(awk -v g="$ug" -v c="$cap" -v l="$ulp" 'BEGIN{
+    lo=$(awk -v g="$ug_eff" 'BEGIN{v=int(g*0.95); if(v<1)v=1; printf "%d", v}')
+    hi=$(awk -v g="$ug_eff" -v c="$cap" -v l="$ulp" 'BEGIN{
       k = 1.25 + l/100*2          # 丢包越高, 真实拐点离 goodput 越远
       if (k > 2.5) k = 2.5
       v = g*k; if (v > c) v = c
       printf "%d", v }')
-    [ -n "$nominal" ] || nominal=$(awk -v g="$ug" 'BEGIN{printf "%d", g}')
-    [ -n "$step" ] || step=$(calc_step "$nominal")
-    info "Policer present, scanning ${lo} -> ${hi} Mbit"
+    [ "$hi" -gt "$lo" ] 2>/dev/null || hi=$(( lo + 2 ))
+    [ -n "$nominal" ] || nominal=$(awk -v g="$ug_eff" 'BEGIN{printf "%d", g}')
+    # 步长必须按【区间宽度】推, 不能按 nominal 推 —— calc_step 对 ≤600M 恒等于 20,
+    # 而小带宽机器的区间可能只有十几宽, 20 的步长只能采到 1-2 个点, 定不出拐点.
+    # 实测香港 CN2: 区间 17→31（宽 14）, step 20 → 只测了 17 和 31 两档.
+    # 目标是区间内约 10 个采样点; 大机器上这个公式给出的值和 calc_step 基本一致.
+    [ -n "$step" ] || step=$(awk -v lo="$lo" -v hi="$hi" 'BEGIN{
+      s = int((hi-lo)/10 + 0.5); if (s < 1) s = 1; printf "%d", s }')
+    info "Policer present, scanning ${lo} -> ${hi} Mbit（不限速实测送达 ${ug_eff} Mbps）"
   fi
 
   echo
@@ -1302,7 +1417,9 @@ cmd_sweep(){
   if [ "$refine" = 1 ] && [ -n "$LAST_OK" ] && [ -n "$BROKE_AT" ] && [ $(( BROKE_AT - LAST_OK )) -gt 5 ]; then
     local fine coarse_broke
     coarse_broke=$BROKE_AT                       # 先存下粗扫的上界, 下面会被 scan_range 重置
-    fine=$(( step / 4 )); [ "$fine" -lt 5 ] && fine=5
+    # 下限 1 而不是 5 —— 步长本身现在按区间宽度推, 小机器上可能只有 1-2,
+    # 硬性抬到 5 会让细扫比粗扫还粗.
+    fine=$(( step / 4 )); [ "$fine" -lt 1 ] && fine=1
     echo
     info "Knee between ${LAST_OK} and ${coarse_broke}, refining with step ${fine}"
     printf '  %-10s %12s %9s %8s  %s\n' "Rate/Mbit" "Goodput/Mbps" "Retrans" "Loss%" "Verdict"
@@ -1367,7 +1484,7 @@ cmd_status(){
   kv "Congestion"  "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   kv "Default qdisc" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
   kv "Active qdisc" "$(tc qdisc show dev "$iface" 2>/dev/null | head -1 | awk '{print $2}')"
-  kv "Egress shaper" "$(tc class show dev "$iface" 2>/dev/null | grep -oE 'rate [0-9]+[MKG]bit' | head -1 || echo 'none')"
+  kv "Egress shaper" "$(first_or "$(r=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)") && echo "${r} Mbit")" none)"
   kv "tcp_rmem"    "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | tr '\t' ' ')"
   kv "tcp_wmem"    "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | tr '\t' ' ')"
   kv "tcp_mem"     "$(sysctl -n net.ipv4.tcp_mem 2>/dev/null | awk '{printf "%.0fM/%.0fM/%.0fM", $1*4/1024,$2*4/1024,$3*4/1024}')"
@@ -1382,7 +1499,7 @@ cmd_status(){
   out=$(awk '/^Tcp: [0-9]/{print $12, $13}' /proc/net/snmp)
   rt=$(echo "$out" | awk '{if($1>0) printf "%.3f%%", $2*100/$1; else print "n/a"}')
   kv "Retrans (boot)" "$rt  (cumulative since boot; use Verify for current)"
-  kv "qdisc drops" "$(tc -s class show dev "$iface" 2>/dev/null | grep -oP 'dropped \K[0-9]+' | head -1 || echo n/a)"
+  kv "qdisc drops" "$(first_or "$(grep -oP 'dropped \K[0-9]+' <<<"$(tc -s class show dev "$iface" 2>/dev/null)")" n/a)"
   kv "Memory"      "$(free -m | awk '/Mem:/{print "已用 "$3"MB / 可用 "$7"MB / 共 "$2"MB"}')"
   kv "Swap"        "$(free -m | awk '/Swap:/{if($2==0) print "none (recommended on low-memory hosts)"; else print $3"/"$2" MB"}')"
   # grep -c 无匹配时输出 0 但退出码 1, 不能用 || 兜底, 否则会打印两个 0
@@ -1448,7 +1565,7 @@ cmd_verify(){
     case "$1" in --peer) peer="$2"; shift 2 ;; --name) peer_name="$2"; shift 2 ;; *) shift ;; esac
   done
   local iface shaper; iface=$(detect_iface)
-  shaper=$(tc class show dev "$iface" 2>/dev/null | grep -oE 'rate [0-9]+[MKG]bit' | head -1 | awk '{print $2}')
+  shaper=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)")
 
   echo
   printf '  %s本机端口能力验证%s\n' "$bold" "$plain"
@@ -1463,12 +1580,12 @@ cmd_verify(){
   fi
   peer_rtt=$(ping $IP_FAMILY -c 2 -q -W 2 "$peer" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
   printf "  对端    %s   RTT %sms   端口 %s\n" "$peer" "${peer_rtt:-?}" "$PEER_PORT"
-  printf "  整形    %s\n" "${shaper:-未设置}"
+  printf "  整形    %s\n" "$(first_or "${shaper:+${shaper} Mbit}" 未设置)"
   echo
   command -v iperf3 >/dev/null || { warn "无 iperf3, 跳过实测"; return 0; }
 
   verify_measure "$peer"
-  verify_verdict "${shaper%Mbit}"
+  verify_verdict "$shaper"
   rule
 }
 
@@ -1515,7 +1632,7 @@ cmd_update(){
   else
     warn "取不到 SHA256SUMS 或没有 sha256sum, 退回版本号校验"
   fi
-  if ! { head -1 "$dl/tcpfit.sh" | grep -q '^#!' && grep -q "^VERSION=\"$latest\"" "$dl/tcpfit.sh"; }; then
+  if ! { starts_with "$(head -1 "$dl/tcpfit.sh" 2>/dev/null)" '#!' && grep -q "^VERSION=\"$latest\"" "$dl/tcpfit.sh"; }; then
     rm -rf "$dl"; die "下载的文件校验不通过, 未更新" 2
   fi
   # 不能原地覆盖 —— 正在执行的就是 $SELF_PATH, 而 bash 是按文件偏移增量读脚本的,
@@ -1579,6 +1696,15 @@ speedtest.mtl2.ca.leaseweb.net|蒙特利尔|Leaseweb
 # 自动挑选对端：先按 RTT 排序, 再逐个验证 iperf3 真的能用（公共服务器常年占线）
 auto_pick_peer(){
   local best="" cand rtt name line
+  # 兜底: 命令行直接跑 sweep/verify 的人不走向导, 拿不到那边的安装提示.
+  # 没有 ping 时下面每个节点都取不到 RTT, sorted 为空 → 静默 return 1,
+  # 调用方报 "公共测速服务器暂时都不可用" —— 服务器是无辜的, 得说真话.
+  if ! command -v ping >/dev/null 2>&1; then
+    warn "本机缺少 ping, 无法自动选择对端." >&2
+    warn "  安装:  apt install -y iputils-ping   /   dnf install -y iputils" >&2
+    warn "  或指定对端:  --peer <iperf3服务器>" >&2
+    echo ""; return 1
+  fi
   info "自动选择测速对端（测的是本机端口上限, 越近越准）…" >&2
   # 并行 ping 全部节点. 串行时 17 个节点 × 最长 4 秒 = 最坏 68 秒, 用户干等.
   local sorted="" prov tmpd
@@ -1661,7 +1787,8 @@ auto_pick_peer(){
 # 就说明是链路本身在丢包, 拿它测拐点必然测偏.
 validate_peer(){
   local peer="$1" nominal="$2" iface="$3"
-  local rate=$(( nominal * 40 / 100 )); [ "$rate" -lt 20 ] && rate=20
+  # 低带宽线路不能硬抬到 20M: 15M 线路会被验证流量自己打穿.
+  local rate=$(( nominal * 40 / 100 )); [ "$rate" -lt 1 ] && rate=1
   qdisc_save "$iface"
   # 早期版本这里没有任何 trap: 中断就把机器留在标称 40% 的限速上, 直到重启
   trap 'qdisc_restore; exit 130' INT TERM HUP
@@ -1671,13 +1798,17 @@ validate_peer(){
   trap - INT TERM HUP
   qdisc_restore
   [ -n "$res" ] || { echo "unreachable"; return 1; }
-  local gp; gp=$(echo "$res" | awk '{print $1}'); rt=$(echo "$res" | awk '{print $2}')
+  local sg gp lp
+  sg=$(echo "$res" | awk '{print $1}'); rt=$(echo "$res" | awk '{print $2}')
+  gp=$(echo "$res" | awk '{print $3}'); [ -n "$gp" ] || gp="$sg"
+  lp=$(loss_pct "$rt" "$sg" 8)
   # 对端连 40% 速率都跑不到, 说明它本身就比本机慢, 拿它测限速器毫无意义.
-  if awk -v g="$gp" -v r="$rate" 'BEGIN{exit !(g < r*0.7)}' 2>/dev/null; then
+  # 只有低重传时才能这样判断；高重传造成的低吞吐属于脏路径, 不是慢对端.
+  if awk -v g="$gp" -v r="$rate" -v l="$lp" \
+     'BEGIN{exit !(g < r*0.7 && l <= 0.05)}' 2>/dev/null; then
     echo "slow:$gp/$rate"; return 1
   fi
   # 低速率下丢包率应该接近 0. 比 sweep 更严(0.05% vs 0.1%), 因为跑的是 40% 速率.
-  local lp; lp=$(loss_pct "$rt" "$gp" 8)
   if awk -v l="$lp" 'BEGIN{exit !(l > 0.05)}' 2>/dev/null; then echo "dirty:${rt}(${lp}%)"; return 1; fi
   echo "clean:$rt"
 }
@@ -1728,7 +1859,7 @@ banner(){
   local iface cc shaper ram cores tuned
   iface=$(detect_iface)
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-  shaper=$(tc class show dev "$iface" 2>/dev/null | grep -oE 'rate [0-9]+[MG]bit' | head -1 | awk '{print $2}')
+  shaper=$(r=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)") && echo "${r}Mbit")
   ram=$(detect_ram_mb); cores=$(detect_cores)
   [ -f "$SYSCTL_FILE" ] && tuned="Tuned" || tuned="Stock"
   clear 2>/dev/null || true
@@ -1776,9 +1907,19 @@ wizard(){
   # 本意是说明规则, 但纯 v4 机器(绝大多数)看到的就只有这一行, 而且没有任何一行
   # 确认"检测到了 v4". tcpfit 其他输出全是状态行, 用户就把"检测不到 IPv4"
   # 读成了对自己机器的判定, 以为脚本认错了. 有用户真这么报过.
+  # 「没有 v4」不等于「有 v6」. 早期这里只判 v4, 判不出来就直接切 -6 ——
+  # 于是 v4/v6 都检测不到的机器被切到一个根本不存在的协议族上, 之后每个节点
+  # ping 都失败, 最后死在"公共测速服务器暂时都不可用". 客户实报过.
   if ! have_ipv4; then
-    IP_FAMILY="-6"
-    ok "本机没有 IPv4, 测速走 IPv6"
+    if have_ipv6; then
+      IP_FAMILY="-6"
+      ok "本机没有 IPv4, 测速走 IPv6"
+    else
+      # 两边都判不出来时保持默认的 -4: 绝大多数机器是纯 v4, 检测失误的可能
+      # 远高于"真的两个都没有". 切到 v6 是必然失败, 留在 v4 至少还有机会.
+      warn "检测不到 IPv4 也检测不到 IPv6 的默认路由, 仍按 IPv4 测速."
+      warn "  若后面选不到对端, 用 --peer 手动指定."
+    fi
   elif have_ipv6; then
     echo
     echo "  本机是 IPv4 + IPv6 双栈, 测速默认走 IPv4."
@@ -1824,6 +1965,32 @@ wizard(){
       warn "没有 iperf3, 只能做基础调优:"
       warn "  不能实测带宽(要你手填)、不能扫限速器拐点、不能验证吞吐."
       warn "  基础调优本身照做, 那是收益最大的一部分."
+    fi
+  fi
+
+  # ping 单独检查, 【不能】嵌进上面 iperf3 的 else 分支里 ——
+  # 实测有机器装了 iperf3 却没有 ping(Ubuntu 22.04 精简镜像), 那样会走进
+  # "iperf3 已经安装" 那一支, 永远问不到 ping.
+  # 缺 ping 的后果: auto_pick_peer 靠它给 18 个节点排延迟, 全拿不到就返回空,
+  # 向导最后报 "公共测速服务器暂时都不可用" —— 那句在甩锅给无辜的对端.
+  if [ "$HAVE_IPERF3" = 1 ] && ! command -v ping >/dev/null 2>&1; then
+    echo
+    echo "  自动挑选测速对端需要 ping, 本机没有."
+    echo
+    if confirm "  安装 ping？" y; then
+      echo "    ────────────────────────────────────────"
+      if   command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y iputils-ping
+      elif command -v dnf     >/dev/null; then dnf install -y iputils
+      elif command -v yum     >/dev/null; then yum install -y iputils
+      elif command -v apk     >/dev/null; then apk add iputils
+      else warn "认不出包管理器, 请手动安装 ping"; fi
+      echo "    ────────────────────────────────────────"
+    fi
+    if command -v ping >/dev/null 2>&1; then
+      ok "ping 已就绪"
+    else
+      warn "本机缺少 ping, 无法自动选择对端."
+      warn "  安装 iputils-ping, 或在下一步手动填写对端."
     fi
   fi
 
@@ -1891,7 +2058,9 @@ wizard(){
   while true; do
     peer=$(ask "  对端 IP / 域名（回车=公共节点）" "")
     if [ -z "$peer" ]; then
-      local picked; picked=$(auto_pick_peer) || die "公共测速服务器暂时都不可用, 稍后再试" 2
+      # 不要断言"服务器不可用" —— 失败原因也可能在本机(缺 ping、协议族选错、出站被封),
+      # auto_pick_peer 已经把真实原因打在上面了, 这里只说结果.
+      local picked; picked=$(auto_pick_peer) || die "没能自动选出对端, 在上一步手动填一个" 2
       peer="${picked%:*}"; PEER_PORT="${picked##*:}"
       break
     fi
@@ -2041,10 +2210,26 @@ wizard(){
   fi
 
   printf '\n  %s[4/5] Apply shaping%s\n' "$bold" "$plain"
+  # 上一轮如果应用过整形, sweep 结束时 qdisc_restore 会把那份配置原样装回来.
+  # 所以"这次没检测到限速器"必须【主动移除】, 否则网卡上还挂着上次的限速值,
+  # 而结果页写着"整形 未设置" —— 屏幕和实际不一致.
+  # 只在 no_knee(确信没有限速器) 时移除; 扫描失败/超范围时并不知道有没有限速器,
+  # 保留上次的配置更安全, 但要说清楚.
   if [ -n "$rate" ]; then cmd_shape --rate "$rate"
-  elif [ -n "$out_of_range" ]; then info "policer present but knee not located in range, shaping skipped"
-  elif [ -n "$no_knee" ]; then info "no policer detected, shaping intentionally skipped"
-  else warn "no knee measured, shaping skipped"; fi
+  elif [ -n "$no_knee" ]; then
+    if [ -x "$QDISC_SCRIPT" ]; then
+      info "本次未发现限速器, 正在移除上次的整形"
+      cmd_shape --off
+    else
+      info "no policer detected, shaping intentionally skipped"
+    fi
+  elif [ -n "$out_of_range" ]; then
+    info "policer present but knee not located in range, shaping skipped"
+    [ -x "$QDISC_SCRIPT" ] && warn "上次的整形保留未动（本次没测准）"
+  else
+    warn "no knee measured, shaping skipped"
+    [ -x "$QDISC_SCRIPT" ] && warn "上次的整形保留未动（本次没测出结果）"
+  fi
 
   printf '\n  %s[5/5] Verify%s\n' "$bold" "$plain"
   command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
@@ -2055,6 +2240,7 @@ wizard(){
 # 结果段落. 正常流程和"手动指定整形值"两条路径共用, 避免两份重复的排版代码.
 wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内存MB> [无拐点]
   local bw="${1:-}" rate="${2:-}" knee="${3:-}" margin="${4:-}" ram="${5:-0}" no_knee="${6:-}" oor="${7:-}"
+  local cur_shape=""
   printf '\n  %s════ 结果 ══════════════════════════════════════════════%s\n' "$bold" "$plain"
   echo
   if [ -n "$knee" ]; then
@@ -2065,19 +2251,23 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
   elif [ -n "$rate" ]; then
     _conf "已应用整形"   "${rate} Mbit"
     echo
-  elif [ -n "$oor" ]; then
-    _conf "整形"         "未设置"
-    _conf "原因"         "检测到限速迹象, 但未在扫描范围内定位到拐点"
-    echo
-  elif [ -n "$no_knee" ]; then
-    _conf "整形"         "未设置"
-    _conf "原因"         "扫描未发现限速器, 加整形只会限制自己"
-    echo
   else
-    _conf "整形"         "未设置"
+    # 这几支都是"本次没应用整形". 但网卡上可能还挂着【上一轮】的限速 ——
+    # 早期版本一律打"未设置", 屏幕和实际不一致. 这里直接读当前状态再报.
+    cur_shape=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
+    if [ -n "$cur_shape" ]; then
+      _conf "整形"       "${cur_shape} Mbit（上次的配置, 本次未改动）"
+    else
+      _conf "整形"       "未设置"
+    fi
+    if   [ -n "$oor" ];     then _conf "原因" "检测到限速迹象, 但未在扫描范围内定位到拐点"
+    elif [ -n "$no_knee" ]; then _conf "原因" "扫描未发现限速器, 加整形只会限制自己"
+    fi
     echo
   fi
-  verify_verdict "$rate"
+  # verify 的判定也要按实况: 本次没应用但网卡上还有旧整形时, 目标值取那个,
+  # 否则会给一台正被限速的机器说"这台没有应用整形".
+  verify_verdict "${rate:-$cur_shape}"
   traffic_report
   echo
   echo "  本次改动和快照位置"
@@ -2086,7 +2276,7 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
   echo "      $SNAPSHOT"
 
   # 小内存且没 swap 才提. 内存够用或已有 swap 就完全不出现这一段.
-  if [ "$ram" -le 1024 ] && ! swapon --show 2>/dev/null | grep -q .; then
+  if [ "$ram" -le 1024 ] && ! not_blank "$(swapon --show 2>/dev/null)"; then
     step "swap"
     echo
     echo "    本机 ${ram} MB 内存且没有 swap. 跑代理时 TCP 缓冲区可能撑爆内存,"
@@ -2135,7 +2325,7 @@ menu_loop(){
            local rate; rate=$(awk -F= '/^RECOMMEND/{print $2}' "$STATE_DIR/sweep.result" 2>/dev/null)
            [ -n "$rate" ] && confirm "  应用 ${rate}Mbit 整形？" y && cmd_shape --rate "$rate"
          else warn "No peer available"; fi ;;
-      4) if swapon --show 2>/dev/null | grep -q .; then
+      4) if not_blank "$(swapon --show 2>/dev/null)"; then
            info "已有 swap: $(free -h | awk '/Swap/{print $2}'), 回车跳过；要再建就输入数字"
            local sg; sg=$(ask "  swap 大小 GB (1-20, 回车跳过)" ""); [ -n "$sg" ] && cmd_harden --swap "$sg"
          else
