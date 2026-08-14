@@ -1,151 +1,87 @@
 # tcpfit
 
-按每台机器实测推导的 TCP 调优工具. 不套用固定参数, 实测 BDP 与限速器拐点.
+面向 NixOS 的 TCP 测量与调优建议工具。它保留原有的 Bash TUI、带宽探测和限速器拐点扫描，但不会自动修改任何系统设置。
 
-本脚本由 [kylin010](https://github.com/Kylin010) 编写和维护.
+所有结果默认保存到 `~/tcpfit`（可用 `TCPFIT_DIR` 覆盖）：
 
-## 安装
+- `tcpfit.nix`：按机器规格推导出的 `boot.kernel.sysctl` 建议
+- `tcpfit-shaper.nix`：扫描找到拐点后生成的 HTB + fq 整形建议
+- `tcpfit-swap.nix`：可选的 swap 建议
+- `facts`、`probe.result`、`sweep.result`、`verify.result`、`summary.txt`：原始测量结果与摘要
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh)
-```
+脚本不写 `/etc`，不创建或启用 systemd service，不加载内核模块，不持久化修改 qdisc，也不会创建 swap。
 
-跑完直接出菜单, 选 1 全自动. 脚本会装到 `/usr/local/bin/tcpfit`, 以后敲 `tcpfit` 即可.
+## 运行
 
-## 三种用法
-
-| 用法 | 命令 |
-|---|---|
-| 一键跑 | `bash <(curl -fsSL .../main/tcpfit.sh)` |
-| 装好后 | `tcpfit` |
-| 子命令 | `tcpfit tune --role proxy --bw 500` |
-
-## 菜单
-
-```
-   1. 一键调优   Auto-tune (recommended)  ~10 min
-   2. 基础调优   Base tuning only          ~1 min
-   3. 拐点测试   Policer sweep             ~8 min
-   4. 加 swap    Add swap (low-memory box)
-   ────────────────────────────────────────────
-   5. 查看状态   Status
-   6. 端口验证   Verify port capability    ~1 min
-   7. 回滚改动   Rollback all changes
-   8. 检查更新   Check for updates
-```
-
-脚本不会自动更新. 装好之后跑的一直是装的那一版, 想升级用菜单 8 或 `tcpfit update` ——
-它只检查, 发现新版本会问你要不要更新.
-
-一键调优只问三个问题: 带宽、测速对端、机器用途. 确认之后跑到底不再打断.
-
-带宽那一问支持四种输入:
-
-| 输入 | 行为 |
-|---|---|
-| 数字 | 按该带宽推导缓冲区, 然后实测拐点 |
-| 回车 | 现场实测带宽, 然后实测拐点 |
-| `m` | 直接填限速值, 跳过拐点扫描 |
-| `0` | 不做整形 |
-
-## 子命令
+在仓库目录中运行：
 
 ```bash
-tcpfit detect                                     # 机器画像
-tcpfit probe    --peer <近处iperf3服务器>          # 探测可用带宽
-tcpfit tune     --role proxy --bw 500             # 基础调优
-tcpfit sweep    --peer <近处iperf3服务器> --nominal 500
-tcpfit shape    --rate 510                        # 应用整形
-tcpfit shape    --off                             # 移除整形, 保留基础调优
-tcpfit harden   --swap 2G                         # 加 swap
-tcpfit verify   --peer <近处iperf3服务器>          # 测速验证
-tcpfit status                                     # 当前配置
-tcpfit rollback                                   # 回滚全部改动
-tcpfit update                                     # 检查更新
+nix run .
 ```
 
-## 多机（未上线）
+这会打开交互式 TUI。菜单、自动选择测速对端、带宽探测和拐点扫描均保留。
 
-多机编排还没在真实环境验证过, 暂时不建议使用. 下面的用法仅供参考.
-
+`probe`、`sweep` 和一键分析中实际测速的部分，为保证 pacing 精度会临时替换网卡 qdisc，因此需要 root 或 `CAP_NET_ADMIN`；结束或中断时会尝试恢复原 qdisc。仅生成基础建议不需要 root。
 
 ```bash
-cp inventory/servers.example.yml inventory/servers.yml
-chmod 600 inventory/servers.yml
-vi inventory/servers.yml
-
-python3 orchestrator/fleet.py detect
-python3 orchestrator/fleet.py tune
-python3 orchestrator/fleet.py sweep
-python3 orchestrator/fleet.py shape --auto
-python3 orchestrator/fleet.py verify
+nix run . -- tune --role proxy --bw 500
+sudo nix run . -- sweep --peer <近处的iperf3服务器> --nominal 500
 ```
 
-选项: `--only 机器名` `--tag 标签` `-j 并发数` `--dry-run`.
-临时执行任意命令: `fleet.py run -- uptime`.
-
-## 它改了什么
-
-| 类别 | 参数 |
-|---|---|
-| 拥塞控制 | `tcp_congestion_control=bbr` + `default_qdisc=fq` |
-| 缓冲区 | `tcp_rmem` / `tcp_wmem` / `rmem_max` / `wmem_max` / `tcp_mem` |
-| 窗口 | `tcp_window_scaling` / `tcp_moderate_rcvbuf` / `tcp_adv_win_scale` |
-| 队列 | `netdev_max_backlog` / `netdev_budget` / `somaxconn` 等 |
-| 连接 | `tcp_tw_reuse` / `tcp_fin_timeout` / `ip_local_port_range` 等 |
-| 起步 | `tcp_slow_start_after_idle=0` / `initcwnd 32` |
-| 出向整形 | HTB 全局上限 + fq 叶子 pacing |
-
-共 32 个 sysctl 参数. 缓冲区和整形值按每台机器实测推导, 不是固定值.
-
-## 拐点扫描怎么工作
-
-先不限速跑一次, 看有没有东西在打你:
-
-| 结果 | 动作 |
-|---|---|
-| 丢包低 | 没有限速器, 不整形 |
-| 丢包高 | 有限速器, 从实测吞吐往上扫找拐点 |
-| 吞吐 > 2500 Mbit | 超出扫描上限, 不扫（可用 `--cap` 调整） |
-
-拐点在"不限速吞吐"的**上面** —— 打穿限速器会让吞吐掉下来, 所以往上找.
-
-## 回滚
+通过 `sudo` 运行时，结果仍会保存给原调用用户的 `~/tcpfit`。若需指定别处：
 
 ```bash
-tcpfit rollback                # 按快照逐项写回, 不是恢复默认
-tcpfit rollback --purge-swap   # 同时删掉 harden 建的 /swapfile
-tcpfit shape --off    # 只去掉整形
+TCPFIT_DIR=/path/to/results nix run .
 ```
 
-首次改动前自动存快照到 `/var/lib/tcpfit/pre-tune.snapshot`, 记录全部 32 项参数的原始值.
-
-swap 默认不动 —— 删掉正在用的 swap 可能让机器立刻 OOM, 要一并撤销得显式加 `--purge-swap`.
-
-改动只落在这些文件, 不碰 `/etc/sysctl.conf`:
+## TUI
 
 ```
-/etc/sysctl.d/99-tcpfit.conf
-/etc/systemd/system/tcpfit-qdisc.service
-/usr/local/sbin/tcpfit-qdisc.sh
-/etc/networkd-dispatcher/routable.d/50-tcpfit-initcwnd
-/etc/modules-load.d/tcpfit-bbr.conf
-/var/lib/tcpfit/
+1. 一键分析   Auto analysis (recommended)
+2. 生成建议   Generate TCP proposal
+3. 拐点测试   Policer sweep
+4. swap 建议  Generate swap proposal
+5. 查看状态   Status
+6. 端口验证   Verify port capability
+7. 撤销说明   Manual rollback guide
+8. 更新说明   Nix flake update guide
 ```
 
-用了 `harden --swap` 还会创建 `/swapfile` 并往 `/etc/fstab` 加一行 —— 这两个 `rollback` 默认不动,
-要一并撤销加 `--purge-swap`. 缺 iperf3 时经你确认后会用包管理器安装它.
+菜单 1 会按原来的交互流程提问、测速并扫描限速器；区别是最后只写出建议文件，不会应用它们。菜单 3 在找到建议整形值后只询问是否保存 NixOS 模块。
 
-## 已知限制
+## 手动应用建议
 
-- 瓶颈在国际链路而非端口时, 整形不会带来提升, 但输出看起来一切正常
-- 扫满区间没找到拐点时会把区间上界当成拐点, 这种情况用 `m` 手动指定
-- 需要 Linux + systemd + iproute2. OpenVZ/LXC 上 `tc` 和 `initcwnd` 可能受限
-- `sweep` 需要一台近处的 iperf3 对端
+先审阅 `~/tcpfit` 下生成的 `.nix` 文件。把需要的模块复制到你的 NixOS 配置目录，然后在 `configuration.nix` 中手动导入：
 
-## 从 nettune 升级
+```nix
+{
+  imports = [
+    ./hardware-configuration.nix
+    ./tcpfit.nix
+    # 只有确认需要整形时才加入：
+    # ./tcpfit-shaper.nix
+    # 只有确认需要 swap 时才加入：
+    # ./tcpfit-swap.nix
+  ];
+}
+```
 
-老机器上的产物文件名还是 `nettune-*`, 新版本会自动检测并搬迁, 快照和 rollback 都保留. 直接跑新版即可.
+确认后由你自行执行：
+
+```bash
+sudo nixos-rebuild switch
+```
+
+要撤销配置，移除相应的 `imports` 项并再次执行 `sudo nixos-rebuild switch`。tcpfit 本身没有可回滚的系统改动。
+
+## 更新
+
+脚本不会自行下载或覆盖 Nix store 中的文件。在仓库目录中更新 flake 后重新运行：
+
+```bash
+nix flake update
+nix run .
+```
 
 ## 许可证
 

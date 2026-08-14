@@ -34,6 +34,19 @@ say(){ printf '\033[0;36m[*]\033[0m %s\n' "$*"; }
 ok(){  printf '\033[0;32m[+]\033[0m %s\n' "$*"; }
 die(){ printf '\033[0;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# NixOS 的 /usr/local 不应作为软件安装位置；flake 会提供完整 TUI 运行环境。
+if [ -e /etc/NIXOS ]; then
+  say "检测到 NixOS，使用 flake 运行 tcpfit（不安装到 /usr/local）"
+  echo
+  echo "    nix run github:$REPO"
+  echo
+  echo "需要带宽探测或拐点扫描时："
+  echo "    sudo nix run github:$REPO"
+  echo
+  echo "结果默认保存到 ~/tcpfit；脚本不会自动应用任何系统设置。"
+  exit 0
+fi
+
 [ "$(id -u)" = 0 ] || die "需要 root"
 command -v curl >/dev/null || die "需要 curl"
 
