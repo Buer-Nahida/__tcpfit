@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.5"
+VERSION="0.5.6"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -1558,12 +1558,48 @@ cmd_sweep(){
     qdisc_set_fq "$iface" || { qdisc_restore; warn "failed to enable fq for unshaped probe"; return 2; }
     local ures urt
     for _ in 1 2 3; do ures=$(run_iperf "$peer" "$dur" 1); [ -n "$ures" ] && break; sleep 8; done
-    qdisc_restore
-    [ -n "$ures" ] || { warn "unshaped probe failed, check the peer"; return 2; }
+    [ -n "$ures" ] || { qdisc_restore; warn "unshaped probe failed, check the peer"; return 2; }
     ug=$(echo "$ures" | awk '{print $1}'); urt=$(echo "$ures" | awk '{print $2}')
     ug_recv=$(echo "$ures" | awk '{print $3}')
     ulp=$(loss_pct "$urt" "$ug" "$dur")
     cap_gp="${ug_recv:-$ug}"
+
+    # 自动带宽探测用 4 流, 这里用单流找 policer. 公共节点偶发拥塞时, 单次
+    # receiver 可能只剩自动探测值的一小部分, 直接拿它推扫描区间会把 40M
+    # 机器误扫成 14M、最终持久限到 12M. 只在低于 70% 时补两次, 正常机器
+    # 不增加时长；三次取 receiver 最高的【整组】结果, sender/重传必须同步换.
+    # 超过扫描 cap 的大带宽机沿用后面的 8 流保护, 不在这里重复增加两轮单流.
+    if [ -n "$nominal" ] && [ "$nominal" -le "$cap" ] 2>/dev/null && awk -v g="$cap_gp" -v n="$nominal" \
+       'BEGIN{exit !(g < n*0.7)}'; then
+      local best_res="$ures" best_gp="$cap_gp" samples=1 sample_n extra
+      local es er egp ert elp
+      info "Single stream reached ${cap_gp} Mbps (<70% of ${nominal}); taking 2 more samples"
+      printf '  %-10s %12s %9s %8s  %s\n' "none (#1)" "$cap_gp" "$urt" "$ulp" "sample"
+      for sample_n in 2 3; do
+        sleep "$GAP"
+        extra=""
+        for _ in 1 2 3; do extra=$(run_iperf "$peer" "$dur" 1); [ -n "$extra" ] && break; sleep 8; done
+        if [ -z "$extra" ]; then
+          printf '  %-10s %12s %9s %8s  %s\n' "none (#${sample_n})" "-" "-" "-" "peer busy, skipped"
+          continue
+        fi
+        samples=$(( samples + 1 ))
+        es=$(echo "$extra" | awk '{print $1}'); ert=$(echo "$extra" | awk '{print $2}')
+        er=$(echo "$extra" | awk '{print $3}'); egp="${er:-$es}"
+        elp=$(loss_pct "$ert" "$es" "$dur")
+        printf '  %-10s %12s %9s %8s  %s\n' "none (#${sample_n})" "$egp" "$ert" "$elp" "sample"
+        if awk -v x="$egp" -v y="$best_gp" 'BEGIN{exit !(x > y)}'; then
+          best_res="$extra"; best_gp="$egp"
+        fi
+      done
+      ures="$best_res"
+      ug=$(echo "$ures" | awk '{print $1}'); urt=$(echo "$ures" | awk '{print $2}')
+      ug_recv=$(echo "$ures" | awk '{print $3}')
+      ulp=$(loss_pct "$urt" "$ug" "$dur")
+      cap_gp="${ug_recv:-$ug}"
+      info "Using best of ${samples}: ${cap_gp} Mbps"
+    fi
+    qdisc_restore
 
     # 大带宽机不能只凭单流决定是否进入扫描. 长 RTT / 对端接收窗口会把 10G
     # 机器的单流压到 2.5G 以下; 如果这条单流又恰好有路径丢包, 旧逻辑会把
@@ -2123,6 +2159,13 @@ validate_peer(){
 # 主操作默认值改成 y 之后, 杂散回车本身已无害, 所以不再调用.
 flush_input(){ :; }
 
+# 只给"按任意键返回"用. 调优一跑十几分钟, 其间用户随手按的键留在 tty 缓冲里,
+# 提示符一出来就被瞬间吃掉 -> 结果页面没看见就回了菜单.
+# 故意不用在 ask/confirm 上, 原因见上面 flush_input 的注释.
+# 坑: read -t 0 只判断"有没有数据", 不消费数据, 用它是死循环; 超时必须非零.
+# 坑2: 重定向从左往右生效, </dev/tty 要写在 2>/dev/null 后面, 否则无 tty 时报错漏出来.
+drain_tty(){ while read -rsn1 -t 0.05 2>/dev/null </dev/tty; do :; done; return 0; }
+
 ask(){  # ask "问题" "默认值"  -> 回显用户输入或默认值
   local q="$1" d="${2:-}" a
   if [ -n "$d" ]; then printf '%s [%s]: ' "$q" "$d" >&2; else printf '%s: ' "$q" >&2; fi
@@ -2643,7 +2686,17 @@ menu_loop(){
     local c; c=$(ask "  请选择 / Select [0-8]" "1")
     echo
     case "$c" in
-      1) wizard ;;
+      1) wizard
+         # 跑完直接退出, 不回菜单. 回菜单要经过 banner 的 clear, 而 clear 发的是
+         # \033[H\033[2J\033[3J —— 那个 3J 连滚动回滚缓冲一起清掉, 往上翻也找不回
+         # 结果. 调优要跑十几分钟, 结果页面就是用户唯一要看的东西, 不能这么洗掉.
+         echo
+         echo "  要继续操作, 重新运行 ${bold}tcpfit${plain}"
+         echo
+         # 退出前必须清掉. 这十几分钟里用户随手按的键还躺在 tty 缓冲里,
+         # 进程一退, 它们就被父 shell 读走当命令执行（实测 ls -la / whoami 真的跑了）.
+         drain_tty
+         exit 0 ;;
       2) local r; r=$(ask "  用途 1) 代理/加速  2) 大文件传输" "1")
          local role=proxy; [ "$r" = 2 ] && role=bulk
          local b; b=$(ask "  带宽 Mbps (回车=自动探测)" "")
@@ -2674,6 +2727,7 @@ menu_loop(){
       *) warn "Invalid selection" ;;
     esac
     echo
+    drain_tty
     printf "  ${yellow}按任意键返回${plain}"
     read -rsn1 </dev/tty 2>/dev/null || read -r </dev/tty 2>/dev/null || true
     echo
