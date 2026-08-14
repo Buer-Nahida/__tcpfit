@@ -8,11 +8,11 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/Buer-Nahida/__tcpfit/main/tcpfit.sh)
 ```
 
-脚本不会安装到 `/usr/local`，不通过 Nix runner 启动，也没有安装器或自更新流程。每次执行上面的命令都会直接运行仓库中的最新脚本并打开原有 TUI。
+脚本不会安装到 `/usr/local`，入口不使用 `nix run`，项目也不作为 flake 包运行；没有安装器或自更新流程。每次执行上面的命令都会直接运行仓库中的最新脚本并打开原有 TUI。
 
 一键分析中的带宽探测和拐点扫描为保持原版 pacing 与计算结果，会在测试期间临时切换网卡 qdisc，并在正常结束或收到中断信号时恢复，因此这些测量沿用原版约束，需要以 root 运行。生成基础配置本身不需要 root。
 
-缺少 `iperf3` 或 `ping` 时，脚本不会替你安装软件；请把 `pkgs.iperf3`、`pkgs.iputils` 加入自己的 NixOS 配置后重建。缺少 `iperf3` 仍可手动填写带宽并生成基础建议。
+当前动作需要 `iperf3` 或 `ping`、但 PATH 中缺少对应命令时，脚本会自动用 `nix shell nixpkgs#iperf3 nixpkgs#iputils -c`（只加入实际缺少的包）重新运行当前脚本。它可能把包下载到 Nix store 缓存，但不会写入系统 profile 或修改 NixOS 配置；临时脚本退出后会删除。
 
 ## 输出
 

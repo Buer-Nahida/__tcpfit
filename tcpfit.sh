@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tcpfit — 单机 TCP 调优代理
 #
-# 纯 bash, 除 iperf3(仅 sweep 需要) 外无依赖, 可在任何最小化 VPS 上直接跑.
+# 纯 bash 主体；需要测速时若缺少 iperf3/ping，会用 nix shell 临时补全 PATH.
 # 所有"该设多少"的判断都由实测或机器规格推导, 不使用抄来的固定值.
 #
 # 用法:
@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.6-nixos"
+VERSION="0.5.7-nixos"
 SCRIPT_URL="${TCPFIT_SCRIPT_URL:-https://raw.githubusercontent.com/Buer-Nahida/__tcpfit/main/tcpfit.sh}"
 
 # NixOS 的 /etc 与 systemd unit 都由声明式配置管理；本工具只做测量和推导，
@@ -329,6 +329,88 @@ disp(){
   printf 'bash <(curl -fsSL %s)' "$SCRIPT_URL"
 }
 
+# ── 临时依赖环境 ────────────────────────────────────────────────────────────
+# 保持 bash <(curl ...) 为唯一入口。只有当前动作确实需要且 PATH 中缺少命令时，
+# 才把【当前这份脚本】复制或重新下载到 /tmp，并在 nix shell 的临时 PATH 中运行。
+# 不写 profile、不改 NixOS 配置；ACTIVE 标记防止包属性异常时无限递归。
+NIX_DEPS=(); NIX_MISSING=()
+resolve_runtime_deps(){
+  local action="${1:-}" need_iperf=0 need_ping=0 needs_root=0
+  NIX_DEPS=(); NIX_MISSING=()
+  shift 2>/dev/null || true
+  case "$action" in
+    ""|menu) need_iperf=1; need_ping=1 ;;
+    probe|sweep) need_iperf=1; needs_root=1 ;;
+    verify)
+      while [ $# -gt 0 ]; do
+        case "$1" in --peer) need_iperf=1; need_ping=1; break ;; esac
+        shift
+      done
+      ;;
+    tune)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --bw)
+            [ "${2:-}" = auto ] && { need_iperf=1; needs_root=1; }
+            shift; [ $# -gt 0 ] && shift
+            ;;
+          *) shift ;;
+        esac
+      done
+      ;;
+  esac
+
+  # 原版先报 root 权限错误，再检查测速依赖；直接子命令保持这个顺序。
+  if [ "$needs_root" = 1 ] && [ "$(id -u)" != 0 ]; then
+    return 0
+  fi
+
+  if [ "$need_iperf" = 1 ] && ! command -v iperf3 >/dev/null 2>&1; then
+    NIX_DEPS+=("nixpkgs#iperf3"); NIX_MISSING+=("iperf3")
+  fi
+  if [ "$need_ping" = 1 ] && ! command -v ping >/dev/null 2>&1; then
+    NIX_DEPS+=("nixpkgs#iputils"); NIX_MISSING+=("ping")
+  fi
+}
+
+ensure_runtime_deps(){
+  resolve_runtime_deps "$@"
+  [ "${#NIX_DEPS[@]}" -gt 0 ] || return 0
+  if [ "${TCPFIT_NIX_SHELL_ACTIVE:-0}" = 1 ]; then
+    die "nix shell 启动后仍缺少: ${NIX_MISSING[*]}（包: ${NIX_DEPS[*]}）"
+  fi
+  command -v nix >/dev/null 2>&1 || \
+    die "缺少 ${NIX_MISSING[*]}，且找不到 nix，无法临时补全依赖"
+
+  local source_path="${BASH_SOURCE[0]:-$0}" runtime rc
+  runtime=$(mktemp "${TMPDIR:-/tmp}/tcpfit-nix-shell.XXXXXX") || \
+    die "无法创建 nix shell 临时脚本"
+  case "$source_path" in
+    /dev/fd/*|/proc/*/fd/*)
+      # process substitution 是管道 fd；Bash 解析到这里时读指针已接近末尾，直接 cp
+      # 只能得到脚本尾巴。入口本来就由 curl 提供，因此重新下载同一 URL 到临时文件。
+      command -v curl >/dev/null 2>&1 || { rm -f -- "$runtime"; die "无法重新读取一键脚本：缺少 curl"; }
+      curl -fsSL "$SCRIPT_URL" -o "$runtime" || { rm -f -- "$runtime"; die "无法重新下载当前脚本: $SCRIPT_URL"; }
+      ;;
+    *)
+      [ -r "$source_path" ] || { rm -f -- "$runtime"; die "无法读取当前脚本: $source_path"; }
+      cp -- "$source_path" "$runtime" || { rm -f -- "$runtime"; die "无法复制当前脚本到 $runtime"; }
+      ;;
+  esac
+
+  TCPFIT_NIX_RUNTIME="$runtime"
+  trap 'rm -f -- "${TCPFIT_NIX_RUNTIME:-}"' EXIT
+  trap 'exit 130' HUP INT TERM
+  info "缺少 ${NIX_MISSING[*]}，临时执行 nix shell ${NIX_DEPS[*]} -c（不写入系统 profile）"
+  nix shell --extra-experimental-features 'nix-command flakes' \
+    "${NIX_DEPS[@]}" -c env TCPFIT_NIX_SHELL_ACTIVE=1 bash "$runtime" "$@"
+  rc=$?
+  trap - EXIT HUP INT TERM
+  rm -f -- "$runtime"
+  TCPFIT_NIX_RUNTIME=""
+  exit "$rc"
+}
+
 # ── 环境检测 ────────────────────────────────────────────────────────────────
 # 默认路由网卡. 【不跟 $IP_FAMILY 走】—— 网卡是物理概念, 整形和 qdisc 打在同一张卡上,
 # 选 v4 还是 v6 测速都是它. 只是纯 v6 机器的 v4 路由表是空的, 所以 v4 查不到时回退查 v6.
@@ -585,7 +667,7 @@ cmd_tune(){
   if [ "$bw" = auto ]; then
     need_net_admin
     [ -n "$peer" ] || die "--bw auto 需要同时给 --peer <近处的iperf3服务器>"
-    command -v iperf3 >/dev/null || die "--bw auto 需要 iperf3"
+    command -v iperf3 >/dev/null || die "nix shell 未能提供 --bw auto 所需的 iperf3"
     info "Probing available bandwidth..."
     bw=$(probe_bandwidth "$peer" "$iface") || bw=""
     [ -n "$bw" ] && ok "Measured ~${bw} Mbps" || die "bandwidth probe failed" 2
@@ -1147,7 +1229,7 @@ probe_bandwidth(){
 cmd_probe(){
   need_net_admin
   take_lock
-  command -v iperf3 >/dev/null || die "需要 iperf3"
+  command -v iperf3 >/dev/null || die "nix shell 未能提供 probe 所需的 iperf3"
   local peer=""
   while [ $# -gt 0 ]; do
     case "$1" in --peer) peer="$2"; shift 2 ;; *) die "未知参数: $1" ;; esac
@@ -1230,7 +1312,7 @@ loss_pct(){   # loss_pct <重传数> <吞吐Mbps> <秒数>
 cmd_sweep(){
   need_net_admin
   take_lock
-  command -v iperf3 >/dev/null || die "需要 iperf3；请先把 pkgs.iperf3 加入你的 NixOS 配置并重建"
+  command -v iperf3 >/dev/null || die "nix shell 未能提供 sweep 所需的 iperf3"
   # GAP: 档与档之间的静置时间, 让上一条流的状态排空, 避免相邻两档互相干扰
   local peer="" nominal="" lo="" hi="" step="" dur=12 par=1 margin="" thresh=0.1 refine=1 GAP=3 cap=2500
   local PRE_SCAN_GAP=15 BASELINE_CAP=0.5
@@ -1781,7 +1863,7 @@ cmd_verify(){
   printf "  对端    %s   RTT %sms   端口 %s\n" "$peer" "${peer_rtt:-?}" "$PEER_PORT"
   printf "  整形    %s\n" "$(first_or "${shaper:+${shaper} Mbit}" 未设置)"
   echo
-  command -v iperf3 >/dev/null || { warn "无 iperf3, 跳过实测"; return 0; }
+  command -v iperf3 >/dev/null || { warn "nix shell 未能提供 iperf3, 跳过实测"; return 0; }
 
   verify_measure "$peer"
   VERIFY_PEER="$peer" save_verify_result "$shaper"
@@ -1843,8 +1925,8 @@ auto_pick_peer(){
   # 没有 ping 时下面每个节点都取不到 RTT, sorted 为空 → 静默 return 1,
   # 调用方报 "公共测速服务器暂时都不可用" —— 服务器是无辜的, 得说真话.
   if ! command -v ping >/dev/null 2>&1; then
-    warn "本机缺少 ping, 无法自动选择对端." >&2
-    warn "  请先把 pkgs.iputils 加入你的 NixOS 配置并重建." >&2
+    warn "nix shell 未能提供 ping, 无法自动选择对端." >&2
+    warn "  请检查 nixpkgs#iputils 是否可用." >&2
     warn "  或指定对端:  --peer <iperf3服务器>" >&2
     echo ""; return 1
   fi
@@ -1883,8 +1965,8 @@ auto_pick_peer(){
     fi
     local pport="$PROBE_PORT_OK"
     [ "$pport" = 5201 ] || printf '%s ' "$(_c '0;33' "5201→$pport")" >&2
-    # 没装 iperf3 时无法做占线探测（iperf3 要等确认之后才装）,
-    # 降级成"端口通就算可用". 选错了也不致命 —— run_iperf 本身会换端口重试.
+    # 依赖补全异常时无法做占线探测，仍降级成"端口通就算可用"。
+    # 选错了也不致命 —— run_iperf 本身会换端口重试.
     if ! command -v iperf3 >/dev/null 2>&1; then
       printf '%s\n' "$(_c '0;32' "reachable (port $pport)")" >&2
       echo "$cand:$pport"; return 0
@@ -2094,8 +2176,8 @@ wizard(){
   else
     HAVE_IPERF3=0; QN=2
     echo
-    warn "没有 iperf3，跳过实测、拐点扫描和吞吐验证。"
-    warn "  请先把 pkgs.iperf3 加入你的 NixOS 配置并重建。"
+    warn "nix shell 未能提供 iperf3，跳过实测、拐点扫描和吞吐验证。"
+    warn "  请检查 nixpkgs#iperf3 是否可用。"
   fi
 
   # ping 单独检查, 【不能】嵌进上面 iperf3 的 else 分支里 ——
@@ -2106,7 +2188,7 @@ wizard(){
   if [ "$HAVE_IPERF3" = 1 ] && ! command -v ping >/dev/null 2>&1; then
     echo
     echo "  自动挑选测速对端需要 ping, 本机没有."
-    warn "  请先把 pkgs.iputils 加入你的 NixOS 配置并重建。"
+    warn "  nix shell 未能提供 ping，请检查 nixpkgs#iputils。"
     warn "  也可以在下一步手动填写对端。"
   fi
 
@@ -2509,6 +2591,8 @@ tcpfit — NixOS TCP 测量与调优建议工具
 结果默认保存到 ~/tcpfit；可用 TCPFIT_DIR 覆盖。
 EOF
 }
+
+ensure_runtime_deps "$@"
 
 case "${1:-}" in
   detect)   shift; cmd_detect "$@" ;;
