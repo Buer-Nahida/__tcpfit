@@ -4,14 +4,14 @@ fleet — 多服务器调优编排器（未上线）
 
 *** 尚未在真实环境验证过, 暂时不建议使用. ***
 
-把 tcpfit.sh 推到清单里的每台机器上并发执行, 收集结果、生成对照报告.
-只依赖 ssh/scp/sshpass + PyYAML, 不需要在目标机装任何东西.
+把 tcpfit.sh 临时推到清单里的每台机器并发执行, 收集结果、生成对照报告.
+临时脚本在命令结束时删除，不安装到目标机的 PATH.
 
 用法:
   fleet.py detect                     并发采集所有机器画像
-  fleet.py tune   [--only NAME,...]   应用基础调优
+  fleet.py tune   [--only NAME,...]   生成基础调优配置
   fleet.py sweep                      实测各机限速拐点（耗时长）
-  fleet.py shape  [--auto]            应用整形；--auto 用 sweep 结果
+  fleet.py shape  [--auto]            生成整形配置；--auto 用 sweep 结果
   fleet.py status                     查看当前状态
   fleet.py verify                     状态 + 吞吐验证
   fleet.py rollback                   回滚
@@ -42,7 +42,7 @@ ROOT = Path(__file__).resolve().parent.parent
 AGENT = ROOT / "tcpfit.sh"
 RESULTS = ROOT / "results"
 DEFAULT_INVENTORY = ROOT / "inventory" / "servers.yml"
-REMOTE_AGENT = "/usr/local/bin/tcpfit"
+REMOTE_AGENT = f"/tmp/tcpfit-{os.getpid()}"
 
 C = {"r": "\033[0;31m","g": "\033[0;32m","y": "\033[0;33m",
      "c": "\033[0;36m","b": "\033[1m","0": "\033[0m"}
@@ -160,7 +160,7 @@ def run_remote(h, command, timeout=1800, dry=False):
 
 
 def push_agent(h, dry=False):
-    """把 agent 推到目标机并赋可执行权限."""
+    """把 agent 暂存到目标机 /tmp 并赋可执行权限."""
     if dry:
         print(f"  {C['y']}[dry]{C['0']} {h.name}: scp agent → {REMOTE_AGENT}")
         return True
@@ -229,8 +229,9 @@ def agent_cmd(h, sub, args):
         rate = h.shape_rate
         if args.auto:
             # 用目标机上 sweep 存下的推荐值
-            return (f"[ -f /var/lib/tcpfit/sweep.result ] && "
-                    f". /var/lib/tcpfit/sweep.result && "
+            return (f"RESULT_DIR=${{TCPFIT_DIR:-$HOME/tcpfit}}; "
+                    f"[ -f \"$RESULT_DIR/sweep.result\" ] && "
+                    f". \"$RESULT_DIR/sweep.result\" && "
                     f"{REMOTE_AGENT} shape --rate $RECOMMEND || "
                     f"{{ echo '没有 sweep 结果, 先跑 fleet.py sweep'; exit 1; }}")
         if not rate:
@@ -248,9 +249,12 @@ def do_agent_action(hosts, sub, args):
             return Result(h, 1,"","推送 agent 失败（检查 ssh 连通性/凭据）", 0.0)
         cmd = agent_cmd(h, sub, args)
         if cmd is None:
+            if not args.dry_run:
+                run_remote(h, f"rm -f -- {shlex.quote(REMOTE_AGENT)}", timeout=60)
             miss = "peer" if sub == "sweep" else "shape_rate"
             return Result(h, 1,"", f"清单里缺少 {miss}, 跳过", 0.0)
-        return run_remote(h, cmd, timeout=args.timeout, dry=args.dry_run)
+        cleanup = f"trap 'rm -f -- {shlex.quote(REMOTE_AGENT)}' EXIT; "
+        return run_remote(h, cleanup + cmd, timeout=args.timeout, dry=args.dry_run)
 
     results = fan_out(hosts, work, args.jobs)
     allok = report(results, f"tcpfit {sub}")

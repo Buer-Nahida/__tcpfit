@@ -22,16 +22,18 @@ set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
 VERSION="0.5.6-nixos"
+SCRIPT_URL="${TCPFIT_SCRIPT_URL:-https://raw.githubusercontent.com/Buer-Nahida/__tcpfit/main/tcpfit.sh}"
+
 # NixOS 的 /etc 与 systemd unit 都由声明式配置管理；本工具只做测量和推导，
-# 从不写入系统配置。结果默认归运行它的用户所有。sudo 运行时仍使用原调用者的家目录。
-if [ -n "${TCPFIT_DIR:-}" ]; then
-  STATE_DIR="${TCPFIT_DIR%/}"
-elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
-  STATE_DIR="$(getent passwd "$SUDO_USER" 2>/dev/null | awk -F: 'NR==1{print $6}')/tcpfit"
-else
-  STATE_DIR="${HOME:-/root}/tcpfit"
+# 从不持久写入系统配置。sudo 运行时仍把结果放到原调用者的 ~/tcpfit。
+RESULT_OWNER=""
+RESULT_HOME="${HOME:-/root}"
+if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+  RESULT_OWNER="$SUDO_USER"
+  _sudo_home=$(getent passwd "$SUDO_USER" 2>/dev/null | awk -F: 'NR==1{print $6}')
+  [ -n "$_sudo_home" ] && RESULT_HOME="$_sudo_home"
 fi
-[ "$STATE_DIR" = "/tcpfit" ] && STATE_DIR="${HOME:-/root}/tcpfit"
+STATE_DIR="${TCPFIT_DIR:-${RESULT_HOME%/}/tcpfit}"
 NIXOS_TUNE_FILE="$STATE_DIR/tcpfit.nix"
 NIXOS_SHAPER_FILE="$STATE_DIR/tcpfit-shaper.nix"
 NIXOS_SWAP_FILE="$STATE_DIR/tcpfit-swap.nix"
@@ -72,14 +74,15 @@ _rpad(){ local w; w=$(_dispw "$1"); printf '%*s%s' $(( $2 - w )) "" "$1"; }
 # 「确认」和「结果」里的两列排版
 _conf(){ printf '      %s %s\n' "$(_pad "$1" 14)" "$2"; }
 
-# 同时跑两个实例会同时抢 qdisc、快照和 sysctl. 用文件锁串行化.
+# 同时跑两个实例会同时抢临时 qdisc 和结果文件. 用文件锁串行化.
 LOCK_FILE="$STATE_DIR/tcpfit.lock"
 ensure_result_dir(){
   mkdir -p "$STATE_DIR" || die "无法创建结果目录: $STATE_DIR"
-  # sudo 启动时不要把结果目录留成 root 所有，方便调用者复制或导入生成的 Nix 文件。
-  if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
-    chown "$SUDO_USER" "$STATE_DIR" 2>/dev/null || true
-  fi
+  [ -z "$RESULT_OWNER" ] || chown "$RESULT_OWNER" "$STATE_DIR" 2>/dev/null || true
+}
+own_results(){
+  [ -n "$RESULT_OWNER" ] || return 0
+  chown "$RESULT_OWNER" "$@" 2>/dev/null || true
 }
 take_lock(){
   command -v flock >/dev/null || return 0
@@ -88,6 +91,7 @@ take_lock(){
   # 永久重定向, 把整个脚本的 stderr 都吞掉, 所有 die/warn 就都看不见了.
   [ -w "$(dirname "$LOCK_FILE")" ] || return 0
   exec 9>"$LOCK_FILE" || return 0
+  own_results "$LOCK_FILE"
   flock -n 9 && return 0
 
   # 锁被占: 可能真有另一个在跑, 也可能是上次异常退出(SSH 断线/被 kill)卡住了.
@@ -131,9 +135,9 @@ take_lock(){
 }
 
 # probe/sweep 为保证 pacing 的测量精度，会临时替换 qdisc 并在结束后恢复；
-# 这需要 CAP_NET_ADMIN（通常就是 sudo）。生成 NixOS 建议本身不需要 root。
+# 沿用原版约束，必须以 root 运行。生成 NixOS 建议本身不需要 root。
 need_net_admin(){
-  [ "$(id -u)" = 0 ] || die "此测量会临时调整 qdisc，需要 root 或 CAP_NET_ADMIN；生成的结果仍保存在 $STATE_DIR"
+  [ "$(id -u)" = 0 ] || die "此测量会临时调整 qdisc，需要 root；生成的结果仍保存在 $STATE_DIR"
 }
 
 # 转圈. 长操作(iperf3 一跑十几秒)不给反馈的话用户会以为卡死了.
@@ -180,8 +184,7 @@ traffic_report(){
 rule(){ printf '  \033[2m%s\033[0m\n' "────────────────────────────────────────────────"; }
 step(){ printf '\n  \033[1;36m▸ %s\033[0m\n' "$*"; }
 
-# 用 bash <(curl ...) 一条命令跑时, $0 是临时 fd, 脚本一退出就没了.
-# 这里把自己装到系统里, 以后想回滚/查状态还能找到.
+# 用 bash <(curl ...) 一条命令运行，不安装脚本，也不依赖 Nix runner。
 # 测速走哪个协议族. 默认 IPv4 —— 双栈机器上 v4 和 v6 到同一个对端的延迟可能差很多,
 # 实测见过同城对端 v4 0.8ms / v6 93ms, 按 v6 的 RTT 选对端会把最好的那个判成"太远".
 # 更麻烦的是 ping 和 iperf3 各自独立解析, 可能一个走 v4 一个走 v6 ——
@@ -254,6 +257,13 @@ starts_with(){ case "$1" in "$2"*) return 0 ;; *) return 1 ;; esac; }   # 等价
 has_word(){ case "$1" in
     "$2"|"$2"[!A-Za-z0-9_]*|*[!A-Za-z0-9_]"$2"|*[!A-Za-z0-9_]"$2"[!A-Za-z0-9_]*) return 0 ;;
     *) return 1 ;; esac; }
+# 原版会实际 modprobe tcp_bbr 再决定是否回退 cubic。生成器不能改内核状态，
+# 用 kmod 的 dry-run 做等价的可加载性检查；modinfo 是精简 kmod 的只读兜底。
+bbr_usable(){
+  has_word "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)" bbr && return 0
+  command -v modprobe >/dev/null 2>&1 && modprobe --dry-run --quiet tcp_bbr >/dev/null 2>&1 && return 0
+  command -v modinfo >/dev/null 2>&1 && modinfo tcp_bbr >/dev/null 2>&1
+}
 # 等价 grep -q . : 只要有【任意非换行字符】就算有内容. 用 [![:space:]] 会把
 # 纯空格的输出判成空, 和原来的行为不一致.
 not_blank(){ case "$1" in *[!$'\n']*) return 0 ;; *) return 1 ;; esac; }
@@ -315,15 +325,9 @@ have_ipv6(){
 
 PEER_PORT="${PEER_PORT:-5201}"   # 选定对端时确定的可用端口
 WIZARD=0                         # 一键流程内为 1：子命令只输出执行日志, 收尾统一由 wizard 打印
-# Nix store 是只读的，不能自安装或自更新。提示优先使用 PATH 中的 tcpfit。
-SELF_PATH="${TCPFIT_SELF_PATH:-$0}"
 disp(){
-  command -v tcpfit >/dev/null 2>&1 && { echo "tcpfit"; return; }
-  echo "$SELF_PATH"
+  printf 'bash <(curl -fsSL %s)' "$SCRIPT_URL"
 }
-# 保留空函数是为了让旧调用路径仍可运行；它们绝不再触碰旧的系统级产物。
-self_install(){ :; }
-migrate_legacy(){ :; }
 
 # ── 环境检测 ────────────────────────────────────────────────────────────────
 # 默认路由网卡. 【不跟 $IP_FAMILY 走】—— 网卡是物理概念, 整形和 qdisc 打在同一张卡上,
@@ -336,18 +340,6 @@ detect_iface(){
   [ -n "$i" ] || i=$(ip -6 route show default 2>/dev/null | awk '{print $5; exit}')
   echo "$i"
 }
-# 网关【只取 v4】. 它唯一的用途是 `ip route replace default via $gw ...`(设 initcwnd),
-# 那是 IPv4 路由表操作, 喂 v6 地址进去会直接报
-# "Error: inet address is expected rather than 2a0f:...". 实测验证过.
-# 纯 v6 机器上这里返回空, 调用方的 [ -n "$gw" ] 会跳过 initcwnd —— 安全降级.
-detect_gw(){    ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
-
-# 只清理 tcpfit 自己写入的 initcwnd/initrwnd. 旧版本没有 ownership marker,
-# 所以兼容两种证据: tcpfit 的持久化 hook, 或快照明确显示调优前没有这两个属性.
-# 重建路由时沿用 `ip route show` 的全部 token, 只剔除窗口字段，避免丢掉
-# metric/proto/src/onlink 等服务商下发的属性.
-clear_owned_initcwnd(){ :; }
-
 # 算 BDP 用的 RTT. 固定 150ms, 不再探测.  用 --rtt 可以覆盖.
 #
 # 为什么不测了 —— 旧做法是 ping 五个国内 DNS 取中位数, 三个问题让它没法用:
@@ -407,7 +399,13 @@ cmd_detect(){
   kv "Memory MB"   "$ram"
   kv "RTT (assumed)" "${rtt}ms  — 固定值, 用于估算 TCP 缓冲区; 要改用 tune --rtt"
   kv "CC available" "$cc_avail"
-  kv "BBR"         "$(has_word "$cc_avail" bbr && echo 是 || echo '未启用（生成的 NixOS 模块会请求 tcp_bbr）')"
+  if has_word "$cc_avail" bbr; then
+    kv "BBR" "是"
+  elif bbr_usable; then
+    kv "BBR" "可加载（生成的 NixOS 模块会请求 tcp_bbr）"
+  else
+    kv "BBR" "不可用（建议将回退到 cubic）"
+  fi
 
   ensure_result_dir
   cat > "$FACTS" <<EOF
@@ -419,6 +417,7 @@ LINK_MBPS=${link:-0}
 KERNEL=$kern
 VIRT=$virt
 EOF
+  own_results "$FACTS"
 }
 
 # 数值参数校验. 所有会改系统的子命令都必须在动手之前调它 ——
@@ -544,55 +543,16 @@ calc_buf_default(){
   esac
 }
 
-# 调优会动到的全部内核参数. 快照和回滚都以这份清单为准 ——
-# 早期版本快照只记了 14 项而 tune 设了 31 项, 回滚后有 17 项在重启前仍是调优值.
-# 加参数时必须同时加到这里, 否则那个参数就回滚不掉.
-TUNED_KEYS="
-  net.core.default_qdisc
-  net.ipv4.tcp_congestion_control
-  net.core.rmem_max
-  net.core.wmem_max
-  net.core.rmem_default
-  net.core.wmem_default
-  net.ipv4.tcp_rmem
-  net.ipv4.tcp_wmem
-  net.ipv4.tcp_mem
-  net.ipv4.tcp_window_scaling
-  net.ipv4.tcp_moderate_rcvbuf
-  net.ipv4.tcp_adv_win_scale
-  net.core.netdev_max_backlog
-  net.core.netdev_budget
-  net.core.netdev_budget_usecs
-  net.core.optmem_max
-  net.core.somaxconn
-  net.ipv4.tcp_max_syn_backlog
-  net.ipv4.tcp_slow_start_after_idle
-  net.ipv4.tcp_no_metrics_save
-  net.ipv4.tcp_mtu_probing
-  net.ipv4.tcp_sack
-  net.ipv4.tcp_dsack
-  net.ipv4.tcp_timestamps
-  net.ipv4.tcp_fastopen
-  net.ipv4.tcp_syncookies
-  net.ipv4.tcp_tw_reuse
-  net.ipv4.tcp_fin_timeout
-  net.ipv4.tcp_keepalive_time
-  net.ipv4.ip_local_port_range
-  vm.min_free_kbytes
-  fs.file-max
-  vm.swappiness
-"
-
 # ── NixOS 结果输出 ──────────────────────────────────────────────────────────
-# 本版本不再制作快照或回滚系统参数：它从不修改系统。保留命令名以保持菜单和 CLI
+# 本版本不再制作快照或回滚系统参数：它从不持久修改系统。保留命令名以保持菜单和 CLI
 # 入口兼容，并明确告诉用户如何撤销已经手动导入的 NixOS 配置。
-take_snapshot(){ ensure_result_dir; }
 cmd_rollback(){
   ensure_result_dir
   [ "$#" = 0 ] || die "NixOS 版本不会创建 swap 或系统配置，rollback 不接受参数"
   info "tcpfit NixOS 版本没有自动应用过任何设置，无需回滚。"
   echo "  若你此前手动导入了生成的模块，请从 configuration.nix 的 imports 中移除它，"
   echo "  然后执行: sudo nixos-rebuild switch"
+  echo "  移除 swap 模块只会停用 swap；如需释放磁盘，请确认已停用后手动删除 /swapfile。"
   echo "  生成的建议和测试结果仍保留在: $STATE_DIR"
 }
 
@@ -651,9 +611,13 @@ cmd_tune(){
   kv "  Buffer default" "$(awk -v v="$buf_def" 'BEGIN{printf "%.0f MB", v/1048576}')  (role $role)"
   kv "  tcp_mem"        "$(echo "$tcp_mem" | awk '{printf "%.0fM / %.0fM / %.0fM", $1*4/1024, $2*4/1024, $3*4/1024}')  (RAM 1/16, 1/8, 1/4)"
 
+  # 原版先尝试 modprobe tcp_bbr，仍不可用才回退 cubic。这里用无副作用的
+  # dry-run 做同一判断，确保同一内核生成相同的拥塞控制参数。
   local cc=bbr
-  has_word "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)" bbr || \
-    warn "当前内核尚未启用 BBR；生成的 NixOS 模块会请求加载 tcp_bbr。"
+  if ! bbr_usable; then
+    warn "kernel has no BBR, falling back to cubic (much smaller gain)"
+    cc=cubic
+  fi
 
   ensure_result_dir
   cat > "$NIXOS_TUNE_FILE" <<EOF
@@ -663,12 +627,14 @@ cmd_tune(){
 # 将其复制到 NixOS 配置目录或在 configuration.nix 中手动 imports = [ $NIXOS_TUNE_FILE ];
 { pkgs, ... }:
 {
+  # 原版即使回退 cubic 也会写入 tcp_bbr 的开机加载项，保持这一持久化建议不变。
   boot.kernelModules = [ "tcp_bbr" ];
   boot.kernel.sysctl = {
     "net.core.default_qdisc" = "fq";
     "net.ipv4.tcp_congestion_control" = "$cc";
-    "net.core.rmem_max" = "$buf_max";
-    "net.core.wmem_max" = "$buf_max";
+    # NixOS 对这两个 sysctl 有专门的 unsigned-int 类型，不能写成字符串。
+    "net.core.rmem_max" = $buf_max;
+    "net.core.wmem_max" = $buf_max;
     "net.core.rmem_default" = "$buf_def";
     "net.core.wmem_default" = "$buf_def";
     "net.ipv4.tcp_rmem" = "4096 $buf_def $buf_max";
@@ -709,12 +675,36 @@ EOF
     wants = [ "network-online.target" ];
     after = [ "network-online.target" ];
     path = [ pkgs.iproute2 pkgs.gawk ];
-    serviceConfig.Type = "oneshot";
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
     script = ''
       gw=$(ip -4 route show default | awk '{print $3; exit}')
       iface=$(ip -4 route show default | awk '{print $5; exit}')
-      [ -n "$gw" ] && [ -n "$iface" ] && \
-        ip -4 route replace default via "$gw" dev "$iface" initcwnd 32 initrwnd 32
+      if [ -n "$gw" ] && [ -n "$iface" ]; then
+        ip -4 route replace default via "$gw" dev "$iface" initcwnd 32 initrwnd 32 || true
+      fi
+      exit 0
+    '';
+    # 服务保持 active，模块被移除或改成 --no-initcwnd 时才会执行清理。
+    # 沿用原版 clear_owned_initcwnd：保留整条默认路由的其他 token，只去掉
+    # initcwnd/initrwnd 及其数值。
+    preStop = ''
+      route=$(ip -4 route show default | awk 'NR == 1 { print; exit }')
+      if [ -n "$route" ]; then
+        clean=$(printf '%s\n' "$route" | awk '{
+          sep = ""
+          for (i = 1; i <= NF; i++) {
+            if ($i == "initcwnd" || $i == "initrwnd") { i++; continue }
+            printf "%s%s", sep, $i
+            sep = " "
+          }
+          print ""
+        }')
+        [ -z "$clean" ] || ip -4 route replace $clean 2>/dev/null || true
+      fi
+      exit 0
     '';
   };
 EOF
@@ -732,6 +722,7 @@ BDP_BYTES=$bdp
 BUFFER_MAX_BYTES=$buf_max
 BUFFER_DEFAULT_BYTES=$buf_def
 TCP_MEM_PAGES=$tcp_mem
+CONGESTION_CONTROL=$cc
 NIXOS_MODULE=$NIXOS_TUNE_FILE
 EOF
   cat > "$SUMMARY" <<EOF
@@ -746,6 +737,7 @@ Nothing in this directory has been applied automatically.
 Review the generated .nix files, then copy or import them into your NixOS configuration and run:
   sudo nixos-rebuild switch
 EOF
+  own_results "$NIXOS_TUNE_FILE" "$STATE_DIR/tune.result" "$SUMMARY"
   ok "NixOS 调优建议已保存: $NIXOS_TUNE_FILE"
   [ "$WIZARD" = 1 ] && return 0
   echo "  本命令没有修改 sysctl、路由、qdisc、systemd 或 swap。"
@@ -768,6 +760,10 @@ cmd_harden(){
   # 不收 "2M"，生成的 NixOS 建议统一以 MiB 填入 swapDevices.size。
   local gb="${swap_size%[Gg]}"
   is_posint "$gb" 1 20 || die "swap 大小请填 1-20 之间的整数, 单位 GB（例如 2 或 2G）"
+  if not_blank "$(swapon --show 2>/dev/null)"; then
+    info "已有 swap, 跳过: $(free -h | awk '/Swap/{print $2}')"
+    return 0
+  fi
   ensure_result_dir
   cat > "$NIXOS_SWAP_FILE" <<EOF
 # tcpfit 的 swap 建议，生成于 $(date -u +%FT%TZ)
@@ -778,6 +774,7 @@ cmd_harden(){
 }
 EOF
   printf 'SWAP_GB=%s\nNIXOS_MODULE=%s\n' "$gb" "$NIXOS_SWAP_FILE" > "$STATE_DIR/swap.result"
+  own_results "$NIXOS_SWAP_FILE" "$STATE_DIR/swap.result"
   ok "NixOS swap 建议已保存: $NIXOS_SWAP_FILE"
   echo "  它建议创建 ${gb}GiB 的 /swapfile；请审阅并手动导入后再执行 nixos-rebuild。"
 }
@@ -900,6 +897,7 @@ cmd_shape(){
   if [ "$off" = 1 ]; then
     rm -f "$NIXOS_SHAPER_FILE"
     printf 'STATUS=OFF\nGENERATED_AT=%s\n' "$(date -u +%FT%TZ)" > "$STATE_DIR/shape.result"
+    own_results "$STATE_DIR/shape.result"
     ok "整形建议已清除；当前系统 qdisc 没有改动"
     return 0
   fi
@@ -913,29 +911,75 @@ cmd_shape(){
 # 网卡: $iface；聚合上限: ${rate}Mbit；burst: ${burst} bytes
 # 此文件尚未被系统导入，也没有应用任何 qdisc 规则。
 { pkgs, ... }:
+let
+  # rate/burst 写入 store 路径；建议值变化时 unit 和 restart trigger 都会变化，
+  # nixos-rebuild switch 因而会重启已 active 的 oneshot，而不是继续沿用旧 HTB。
+  qdiscScript = pkgs.writeShellScript "tcpfit-qdisc" ''
+    IF="$iface"
+    TC="\${pkgs.iproute2}/bin/tc"
+    \$TC qdisc del dev \$IF root 2>/dev/null || {
+      \$TC qdisc replace dev \$IF root handle 1: mq || exit 1
+      \$TC qdisc del dev \$IF root || exit 1
+    }
+    \$TC qdisc add dev \$IF root handle 1: htb default 10 || exit 1
+    \$TC class add dev \$IF parent 1: classid 1:10 htb rate ${rate}mbit ceil ${rate}mbit burst ${burst} cburst ${burst} quantum 1514 || exit 1
+    \$TC qdisc add dev \$IF parent 1:10 handle 10: fq limit 40960 flow_limit 8192 maxrate ${rate}mbit || exit 1
+  '';
+in
 {
+  # 同一个声明式 helper 也暴露到固定路径，便于检查当前 tcpfit 整形结构。
+  environment.etc."tcpfit/qdisc.sh".source = qdiscScript;
+
   systemd.services.tcpfit-shaper = {
     description = "tcpfit egress shaper";
     wantedBy = [ "multi-user.target" ];
     wants = [ "network-online.target" ];
     after = [ "network-online.target" ];
-    path = [ pkgs.iproute2 ];
-    serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
-    script = ''
+    restartTriggers = [ qdiscScript ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = qdiscScript;
+    };
+    preStop = ''
+      TC="\${pkgs.iproute2}/bin/tc"
       IF="$iface"
-      tc qdisc del dev \$IF root 2>/dev/null || {
-        tc qdisc replace dev \$IF root handle 1: mq || exit 1
-        tc qdisc del dev \$IF root || exit 1
-      }
-      tc qdisc add dev \$IF root handle 1: htb default 10
-      tc class add dev \$IF parent 1: classid 1:10 htb rate ${rate}mbit ceil ${rate}mbit burst ${burst} cburst ${burst} quantum 1514
-      tc qdisc add dev \$IF parent 1:10 handle 10: fq limit 40960 flow_limit 8192 maxrate ${rate}mbit
+      \$TC qdisc del dev \$IF root 2>/dev/null || true
+      out=\$(\$TC qdisc show dev \$IF 2>/dev/null || true)
+      kind=\$(printf '%s\n' "\$out" | \${pkgs.gawk}/bin/awk \
+        '\$1=="qdisc"{for(i=1;i<=NF;i++) if(\$i=="root"){print \$2; exit}}')
+      case "\$kind" in
+        fq) ;;
+        mq)
+          \$TC qdisc replace dev \$IF root handle 1: mq 2>/dev/null || exit 0
+          n=1
+          for q in /sys/class/net/\$IF/queues/tx-*; do
+            [ -e "\$q" ] || continue
+            \$TC qdisc replace dev \$IF parent 1:\$n fq 2>/dev/null || exit 0
+            n=\$(( n + 1 ))
+          done
+          ;;
+        *)
+          set -- /sys/class/net/\$IF/queues/tx-*
+          if [ "\$#" -gt 1 ]; then
+            \$TC qdisc replace dev \$IF root handle 1: mq 2>/dev/null || exit 0
+            n=1
+            for q in "\$@"; do
+              \$TC qdisc replace dev \$IF parent 1:\$n fq 2>/dev/null || exit 0
+              n=\$(( n + 1 ))
+            done
+          else
+            \$TC qdisc replace dev \$IF root fq 2>/dev/null || true
+          fi
+          ;;
+      esac
     '';
   };
 }
 EOF
   printf 'STATUS=RECOMMEND\nRATE_MBIT=%s\nIFACE=%s\nNIXOS_MODULE=%s\n' \
     "$rate" "$iface" "$NIXOS_SHAPER_FILE" > "$STATE_DIR/shape.result"
+  own_results "$NIXOS_SHAPER_FILE" "$STATE_DIR/shape.result"
   ok "NixOS 整形建议已保存: $NIXOS_SHAPER_FILE"
   echo "  没有修改当前 qdisc 或创建 systemd 服务；审阅后手动导入即可。"
 }
@@ -962,14 +1006,32 @@ apply_test_shaper(){   # apply_test_shaper <iface> <rate_mbit>
 # ── 测试用 qdisc 的保存与恢复 ────────────────────────────────────────────────
 # probe / validate_peer / sweep 都要临时换掉根 qdisc. 早期版本恢复时一律装成 fq,
 # 于是原来的 mq(多队列网卡的正常结构)、CAKE 等配置被永久吞掉且无提示.
-# 现在完整记下原始根 qdisc, 结束时按原样恢复.
-QSAVE_KIND=""; QSAVE_LEAF_KIND=""; QSAVE_IFACE=""
+# 对结构与 tcpfit 完全一致的 HTB 捕获速率并重建，避免只恢复一个没有 class 的空根。
+QSAVE_KIND=""; QSAVE_LEAF_KIND=""; QSAVE_IFACE=""; QSAVE_HTB_RATE=""
+
+qdisc_tcpfit_htb_rate(){   # qdisc_tcpfit_htb_rate <iface>
+  local qout class
+  qout=$(tc qdisc show dev "$1" 2>/dev/null)
+  awk 'BEGIN{ok=0}
+       $1=="qdisc" && $2=="htb" && $3=="1:"{
+         for(i=1;i<=NF;i++) if($i=="root") ok=1
+       } END{exit !ok}' <<<"$qout" || return 1
+  awk 'BEGIN{ok=0}
+       $1=="qdisc" && $2=="fq" && $3=="10:"{
+         for(i=1;i<NF;i++) if($i=="parent" && $(i+1)=="1:10") ok=1
+       } END{exit !ok}' <<<"$qout" || return 1
+  class=$(tc class show dev "$1" 2>/dev/null | awk '$1=="class" && $2=="htb" && $3=="1:10"{print; exit}')
+  [ -n "$class" ] || return 1
+  tc_rate_mbit "$class"
+}
+
 qdisc_save(){   # qdisc_save <iface>
   local out handle major
   QSAVE_IFACE="$1"
   out=$(tc qdisc show dev "$1" 2>/dev/null)
   QSAVE_KIND=$(awk '$1=="qdisc"{for(i=1;i<=NF;i++) if($i=="root"){print $2; exit}}' <<<"$out")
   QSAVE_LEAF_KIND=""
+  QSAVE_HTB_RATE=""
   if [ "$QSAVE_KIND" = mq ]; then
     handle=$(awk '$1=="qdisc" && $2=="mq"{
       for(i=1;i<=NF;i++) if($i=="root"){print $3; exit}}' <<<"$out")
@@ -980,6 +1042,8 @@ qdisc_save(){   # qdisc_save <iface>
         if((m=="0" && (p ~ /^:/ || index(p,"0:")==1)) || (m!="0" && index(p,m ":")==1)){print $2; exit}
         break}}
     ' <<<"$out")
+  elif [ "$QSAVE_KIND" = htb ]; then
+    QSAVE_HTB_RATE=$(qdisc_tcpfit_htb_rate "$1" 2>/dev/null) || QSAVE_HTB_RATE=""
   fi
 }
 # 把本脚本起的 iperf3 全部收掉. 只杀自己的子进程, 不动用户手工跑的.
@@ -1015,6 +1079,13 @@ qdisc_restore(){
       [ -z "$QSAVE_LEAF_KIND" ] || \
         qdisc_set_mq_leaves "$QSAVE_IFACE" "$QSAVE_LEAF_KIND" 2>/dev/null || return 1
       ;;
+    htb)
+      if [ -n "$QSAVE_HTB_RATE" ]; then
+        apply_test_shaper "$QSAVE_IFACE" "$QSAVE_HTB_RATE" || return 1
+      else
+        tc qdisc add dev "$QSAVE_IFACE" root htb 2>/dev/null
+      fi
+      ;;
     ""|noqueue|pfifo_fast) : ;;
     *) tc qdisc add dev "$QSAVE_IFACE" root "$QSAVE_KIND" 2>/dev/null ;;
   esac
@@ -1030,7 +1101,12 @@ qdisc_restore(){
 qdisc_guard(){   # qdisc_guard <iface>
   local k; k=$(qdisc_root_kind "$1")
   case "$k" in
-    ""|mq|fq|noqueue|pfifo_fast|fq_codel|htb) return 0 ;;
+    ""|mq|fq|noqueue|pfifo_fast|fq_codel) return 0 ;;
+    htb)
+      if qdisc_tcpfit_htb_rate "$1" >/dev/null 2>&1; then
+        return 0
+      fi
+      ;;
   esac
   warn "本机根 qdisc 是 ${k}, 测试期间会被临时替换."
   warn "结束时只能恢复成 ${k} 的默认参数, 自己的调优配置会丢失."
@@ -1083,10 +1159,11 @@ cmd_probe(){
   local bw; bw=$(probe_bandwidth "$peer" "$iface")
   [ -n "$bw" ] || die "探测失败, 检查对端 $peer 是否可达/空闲" 2
   ensure_result_dir; echo "BW_MBPS=$bw" > "$STATE_DIR/probe.result"
+  own_results "$STATE_DIR/probe.result"
   ok "估计可用带宽 ≈ ${bw} Mbps"
   echo
   echo "  这只是给 tune 算 BDP 用的估计值, 真正的限速器拐点靠 sweep 实测."
-  echo "  下一步: $0 tune --role <proxy|bulk|mixed> --bw $bw"
+  echo "  下一步: $(disp) tune --role <proxy|bulk|mixed> --bw $bw"
 }
 
 # ── 限速器拐点扫描 ──────────────────────────────────────────────────────────
@@ -1153,7 +1230,7 @@ loss_pct(){   # loss_pct <重传数> <吞吐Mbps> <秒数>
 cmd_sweep(){
   need_net_admin
   take_lock
-  command -v iperf3 >/dev/null || die "需要 iperf3；NixOS 可用: nix shell nixpkgs#iperf3"
+  command -v iperf3 >/dev/null || die "需要 iperf3；请先把 pkgs.iperf3 加入你的 NixOS 配置并重建"
   # GAP: 档与档之间的静置时间, 让上一条流的状态排空, 避免相邻两档互相干扰
   local peer="" nominal="" lo="" hi="" step="" dur=12 par=1 margin="" thresh=0.1 refine=1 GAP=3 cap=2500
   local PRE_SCAN_GAP=15 BASELINE_CAP=0.5
@@ -1397,6 +1474,7 @@ cmd_sweep(){
       warn "不限速 ${cap_streams} 流能送达 ${cap_gp} Mbps, 超过 ${cap} Mbit 的扫描上限."
       echo "  本工具主要面向国内优化线路, 这个带宽下整形基本不会触发."
       mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nABOVE_CAP=%s\nUNSHAPED=%s\n' "$cap" "$cap_gp" > "$STATE_DIR/sweep.result"
+      own_results "$STATE_DIR/sweep.result"
       traffic_report
       return 3
     fi
@@ -1406,6 +1484,7 @@ cmd_sweep(){
       echo
       warn "不限速送达 ${cap_gp} Mbps, 丢包 ${ulp}%, 未检测到限速器."
       mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nUNSHAPED=%s\n' "$cap_gp" > "$STATE_DIR/sweep.result"
+      own_results "$STATE_DIR/sweep.result"
       traffic_report
       return 3
     fi
@@ -1547,11 +1626,13 @@ cmd_sweep(){
       echo "  限速器应该存在, 只是不在本次扫描范围内. 可以扩大范围重扫:"
       echo "    $(disp) sweep --peer <对端> --from ${hi} --to $(( hi * 2 ))"
       mkdir -p "$STATE_DIR"; printf 'OUT_OF_RANGE=1\nSCANNED_TO=%s\n' "$hi" > "$STATE_DIR/sweep.result"
+      own_results "$STATE_DIR/sweep.result"
       traffic_report
       return 3
     fi
     warn "扫到 ${hi} Mbit 仍未出现丢包跳变, 未检测到限速器."
     mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nSCANNED_TO=%s\n' "$hi" > "$STATE_DIR/sweep.result"
+    own_results "$STATE_DIR/sweep.result"
     traffic_report
     return 3
   fi
@@ -1560,6 +1641,7 @@ cmd_sweep(){
   [ -n "$margin" ] || margin=$(calc_margin "$nominal")
   local final=$(( knee - margin )); [ "$final" -lt 1 ] && final=$knee
   mkdir -p "$STATE_DIR"; echo "KNEE=$knee"$'\n'"RECOMMEND=$final" > "$STATE_DIR/sweep.result"
+  own_results "$STATE_DIR/sweep.result"
   # 一键流程里这些数字由 wizard 在「结果」里统一呈现, 这里只出执行日志
   if [ "$WIZARD" = 1 ]; then
     ok "Knee ${knee} Mbit, margin ${margin} Mbit -> shape at ${final} Mbit"
@@ -1587,8 +1669,8 @@ cmd_status(){
   kv "Backlog"     "$(sysctl -n net.core.netdev_max_backlog 2>/dev/null)"
   kv "initcwnd"    "$(ip route show default | grep -oE 'initcwnd [0-9]+' || echo '默认(10)')"
   kv "tcpfit results" "$STATE_DIR"
-  kv "NixOS TCP module" "$([ -f "$NIXOS_TUNE_FILE" ] && echo "$NIXOS_TUNE_FILE（未应用）" || echo 无)"
-  kv "NixOS shaper" "$([ -f "$NIXOS_SHAPER_FILE" ] && echo "$NIXOS_SHAPER_FILE（未应用）" || echo 无)"
+  kv "NixOS TCP module" "$([ -f "$NIXOS_TUNE_FILE" ] && echo "$NIXOS_TUNE_FILE（已生成）" || echo 无)"
+  kv "NixOS shaper" "$([ -f "$NIXOS_SHAPER_FILE" ] && echo "$NIXOS_SHAPER_FILE（已生成）" || echo 无)"
   echo
   echo "── Health ──"
   local out rt
@@ -1632,6 +1714,7 @@ SINGLE_STREAM_RETRANS=${VR1:-}
 FOUR_STREAM_MBPS=${VG4:-}
 FOUR_STREAM_RETRANS=${VR4:-}
 EOF
+  own_results "$STATE_DIR/verify.result"
 }
 
 # 打印验证结果表 + 结论. $1 = 当前整形值(Mbit, 可空)
@@ -1711,10 +1794,9 @@ cmd_update(){
   [ "$#" = 0 ] || [ "${1:-}" = "--from-menu" ] || die "未知参数: $1"
   echo "  当前版本: v$VERSION"
   echo
-  echo "  NixOS 的 tcpfit 由 flake 管理，脚本不会自下载或覆盖 /nix/store 中的文件。"
-  echo "  在项目目录更新 flake 输入后运行："
-  echo "      nix flake update"
-  echo "      nix run ."
+  echo "  tcpfit 是纯一键脚本，不安装到系统，也不会在当前进程里自更新。"
+  echo "  每次运行下面的命令都会直接使用 main 上的最新版本："
+  echo "      $(disp)"
 }
 
 # ── 交互式菜单 ──────────────────────────────────────────────────────────────
@@ -1762,7 +1844,7 @@ auto_pick_peer(){
   # 调用方报 "公共测速服务器暂时都不可用" —— 服务器是无辜的, 得说真话.
   if ! command -v ping >/dev/null 2>&1; then
     warn "本机缺少 ping, 无法自动选择对端." >&2
-    warn "  NixOS:  nix shell nixpkgs#iputils  （或通过本项目的 nix run . 启动）" >&2
+    warn "  请先把 pkgs.iputils 加入你的 NixOS 配置并重建." >&2
     warn "  或指定对端:  --peer <iperf3服务器>" >&2
     echo ""; return 1
   fi
@@ -1935,7 +2017,7 @@ banner(){
   _top
   _row "$(printf '  tcpfit - VPS TCP Optimization%s ' "$(_rpad "v$VERSION" 23)")" '0;32'
   _row "  本脚本由 kylin010 编写和维护"
-  _row "  github.com/Kylin010/tcpfit"
+  _row "  github.com/Buer-Nahida/__tcpfit"
   _sep
   _row "  0. Exit"
   _item 1 "一键分析" "Auto analysis (recommended)" "~10 min"
@@ -1946,7 +2028,7 @@ banner(){
   _item 5 "查看状态" "Status"
   _item 6 "端口验证" "Verify port capability"    "~1 min"
   _item 7 "撤销说明" "Manual rollback guide"
-  _item 8 "更新说明" "Nix flake update guide"
+  _item 8 "更新说明" "Bash one-click update guide"
   _bot
   printf "  %-9s %s core / %s MB / %s\n" "Machine" "$cores" "$ram" "$(uname -r)"
   printf "  %-9s cc=%s  shaper=%s  " "Network" "${cc:-?}" "${shaper:-none}"
@@ -1968,6 +2050,7 @@ wizard(){
   echo "  本版本不会自动应用 sysctl、路由、qdisc、systemd 或 swap 设置。"
   echo "  测量结果和可手动导入的 NixOS 模块会保存到"
   echo "      $(_c '1' "$STATE_DIR")"
+  echo "  带宽探测和拐点扫描仍会按原算法临时切换 qdisc，结束或中断后恢复。"
 
   # 协议族: 默认 IPv4; 纯 v6 机器自动走 v6; 双栈才问.
   # 每个分支只说跟这台机器有关的话.
@@ -2004,9 +2087,7 @@ wizard(){
     ok "测速走 IPv${IP_FAMILY#-}"
   fi
 
-  # iperf3 单独放在最前面确认 —— 两个原因:
-  #   1) 装包是会改系统的操作, 不该在用户点头之前做
-  #   2) 选对端那一步要用 iperf3 做占线探测, 所以必须在三个问题之前就位
+  # iperf3 单独放在最前面确认：选对端要用它做占线探测，所以必须在问题之前就位。
   local HAVE_IPERF3=1 QN=3
   if command -v iperf3 >/dev/null 2>&1; then
     echo "  iperf3 已经安装 $(iperf3 --version 2>/dev/null | awk 'NR==1{print $2}')"
@@ -2014,7 +2095,7 @@ wizard(){
     HAVE_IPERF3=0; QN=2
     echo
     warn "没有 iperf3，跳过实测、拐点扫描和吞吐验证。"
-    warn "  NixOS 请通过本项目运行 nix run .，或临时执行: nix shell nixpkgs#iperf3"
+    warn "  请先把 pkgs.iperf3 加入你的 NixOS 配置并重建。"
   fi
 
   # ping 单独检查, 【不能】嵌进上面 iperf3 的 else 分支里 ——
@@ -2025,7 +2106,7 @@ wizard(){
   if [ "$HAVE_IPERF3" = 1 ] && ! command -v ping >/dev/null 2>&1; then
     echo
     echo "  自动挑选测速对端需要 ping, 本机没有."
-    warn "  NixOS 请通过本项目运行 nix run .，或临时执行: nix shell nixpkgs#iputils"
+    warn "  请先把 pkgs.iputils 加入你的 NixOS 配置并重建。"
     warn "  也可以在下一步手动填写对端。"
   fi
 
@@ -2083,9 +2164,8 @@ wizard(){
   echo "           完整列表见 iperf3serverlist.net"
   echo
   echo "    B) 用你自己的另一台机器"
-  echo "       在那台机器上执行这两条："
-  printf "           %sapt install -y iperf3%s    # 装 iperf3；已装过会跳过, 不会重装\n" "$green" "$plain"
-  printf "           %siperf3 -s%s                # 启动服务端, 默认监听 5201 端口\n" "$green" "$plain"
+  echo "       确保那台机器已有 iperf3，然后启动服务端："
+  printf "           %siperf3 -s%s                # 默认监听 5201 端口\n" "$green" "$plain"
   echo "       然后在下面填那台机器的 IP, 例如  1.2.3.4"
   printf "       %s本脚本默认连 5201 端口%s；对端换了端口的话填  IP:端口  形式. \n" "$yellow" "$plain"
   echo "       对端要选离本机近的."
@@ -2162,7 +2242,7 @@ wizard(){
   _conf "用途" "$([ "$role" = bulk ] && echo '大文件传输 / 备份' || echo '代理 / 加速')"
   if [ "$HAVE_IPERF3" = 1 ]; then _conf "iperf3" "$(iperf3 --version 2>/dev/null | awk 'NR==1{print $2}')"
   else _conf "iperf3" "无, 只做基础调优"; fi
-  _conf "安装位置" "$SELF_PATH"
+  _conf "结果目录" "$STATE_DIR"
   echo
   if [ -n "$MANUAL_RATE" ]; then _conf "预计耗时" "约 1 分钟"
   else                              _conf "预计耗时" "约 10 分钟"; fi
@@ -2223,8 +2303,9 @@ wizard(){
     fi
     printf '\n  %s[3/3] Measure current path%s\n' "$bold" "$plain"
     command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
-    VERIFY_PEER="$peer" save_verify_result ""
-    wizard_result "$bw" "$rate" "$knee" "$margin" "$ram"
+    local current_shape; current_shape=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
+    VERIFY_PEER="$peer" save_verify_result "$current_shape"
+    wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "" "" "" "$current_shape"
     return 0
   fi
 
@@ -2261,13 +2342,17 @@ wizard(){
   # 仅写出建议；绝不应用、移除或覆盖当前系统 qdisc。
   if [ -n "$rate" ]; then cmd_shape --rate "$rate"
   elif [ -n "$out_of_range" ]; then
-    info "policer present but knee not located in range; no shaping recommendation generated"
+    info "policer present but knee not located in range; no new shaping recommendation generated"
+    [ -f "$NIXOS_SHAPER_FILE" ] && warn "上一次的整形建议保留未动（本次没测准）"
   elif [ -n "$above_cap" ]; then
-    info "unshaped throughput exceeds the sweep cap; no shaping recommendation generated"
+    info "unshaped throughput exceeds the sweep cap; no new shaping recommendation generated"
+    [ -f "$NIXOS_SHAPER_FILE" ] && warn "超过扫描上限，无法判断限速器；上一次的建议保留未动"
   elif [ -n "$no_knee" ]; then
-    info "no policer detected; no shaping recommendation generated"
+    info "no policer detected; removing any previous shaping recommendation"
+    cmd_shape --off
   else
-    warn "no knee measured; no shaping recommendation generated"
+    warn "no knee measured; no new shaping recommendation generated"
+    [ -f "$NIXOS_SHAPER_FILE" ] && warn "上一次的整形建议保留未动（本次没有有效结果）"
   fi
 
   printf '\n  %s[5/5] Measure current path%s\n' "$bold" "$plain"
@@ -2279,14 +2364,17 @@ wizard(){
     sleep 15
   fi
   command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
-  VERIFY_PEER="$peer" save_verify_result ""
+  local current_shape; current_shape=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
+  VERIFY_PEER="$peer" save_verify_result "$current_shape"
 
-  wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "$no_knee" "$out_of_range" "$above_cap"
+  wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "$no_knee" "$out_of_range" "$above_cap" "$current_shape"
 }
 
 # 结果段落. 正常流程和"手动指定整形值"两条路径共用, 避免两份重复的排版代码.
 wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内存MB> [无拐点] [超范围] [超上限]
-  local bw="${1:-}" rate="${2:-}" knee="${3:-}" margin="${4:-}" ram="${5:-0}" no_knee="${6:-}" oor="${7:-}" cap="${8:-}"
+  local bw="${1:-}" rate="${2:-}" knee="${3:-}" margin="${4:-}" ram="${5:-0}" no_knee="${6:-}" oor="${7:-}" cap="${8:-}" current_shape="${9:-}"
+  local saved_rate=""
+  [ -f "$NIXOS_SHAPER_FILE" ] && saved_rate=$(awk -F= '/^RATE_MBIT=/{print $2; exit}' "$STATE_DIR/shape.result" 2>/dev/null)
   printf '\n  %s════ 结果 ══════════════════════════════════════════════%s\n' "$bold" "$plain"
   echo
   if [ -n "$knee" ]; then
@@ -2303,18 +2391,19 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
     if   [ -n "$oor" ];     then _conf "原因" "检测到限速迹象, 但未在扫描范围内定位到拐点"
     elif [ -n "$cap" ];     then
       _conf "原因" "不限速吞吐超过 ${cap} Mbit 扫描上限"
-      _conf ""     "未生成整形建议"
+      _conf ""     "本次未生成新的整形建议"
     elif [ -n "$no_knee" ]; then _conf "原因" "扫描未发现限速器, 加整形只会限制自己"
     fi
+    [ -n "$saved_rate" ] && _conf "保留建议" "${saved_rate} Mbit（上一轮，本次未改动）"
     echo
   fi
   echo "  以下验证只测量当前系统；本次生成的建议尚未应用。"
-  verify_verdict ""
+  verify_verdict "$current_shape"
   traffic_report
   echo
   echo "  本次结果位置"
   echo "      $NIXOS_TUNE_FILE"
-  [ -n "$rate" ] && echo "      $NIXOS_SHAPER_FILE"
+  [ -f "$NIXOS_SHAPER_FILE" ] && echo "      $NIXOS_SHAPER_FILE"
   echo "      $SUMMARY"
 
   # 小内存且没 swap 才提；这里只生成 NixOS 建议，不会创建或启用 swap。
@@ -2353,7 +2442,7 @@ menu_loop(){
          # \033[H\033[2J\033[3J —— 那个 3J 连滚动回滚缓冲一起清掉, 往上翻也找不回
          # 结果. 调优要跑十几分钟, 结果页面就是用户唯一要看的东西, 不能这么洗掉.
          echo
-         echo "  要继续操作, 重新运行 ${bold}tcpfit${plain}"
+         echo "  要继续操作, 重新运行 ${bold}$(disp)${plain}"
          echo
          # 退出前必须清掉. 这十几分钟里用户随手按的键还躺在 tty 缓冲里,
          # 进程一退, 它们就被父 shell 读走当命令执行（实测 ls -la / whoami 真的跑了）.
@@ -2374,8 +2463,13 @@ menu_loop(){
            local rate; rate=$(awk -F= '/^RECOMMEND/{print $2}' "$STATE_DIR/sweep.result" 2>/dev/null)
            [ -n "$rate" ] && confirm "  保存 ${rate}Mbit 的 NixOS 整形建议？" y && cmd_shape --rate "$rate"
          else warn "No peer available"; fi ;;
-      4) echo "  输入 1-20 的数字（单位 GB）, 推荐 1-4；回车 = 2；输入 0 = 取消."
-         local sg; sg=$(ask "  swap 大小 GB" "2"); [ "$sg" != 0 ] && cmd_harden --swap "$sg" ;;
+      4) if not_blank "$(swapon --show 2>/dev/null)"; then
+           info "已有 swap: $(free -h | awk '/Swap/{print $2}'), 回车跳过；要生成建议就输入数字"
+           local sg; sg=$(ask "  swap 大小 GB (1-20, 回车跳过)" ""); [ -n "$sg" ] && cmd_harden --swap "$sg"
+         else
+           echo "  输入 1-20 的数字（单位 GB）, 推荐 1-4；回车 = 2；输入 0 = 取消."
+           local sg; sg=$(ask "  swap 大小 GB" "2"); [ "$sg" != 0 ] && cmd_harden --swap "$sg"
+         fi ;;
       5) cmd_status ;;
       6) local p; if p=$(auto_pick_peer); then PEER_PORT="${p##*:}"; cmd_verify --peer "${p%:*}"; else cmd_verify; fi ;;
       7) cmd_rollback ;;
@@ -2393,23 +2487,27 @@ menu_loop(){
 
 # ── 入口 ────────────────────────────────────────────────────────────────────
 usage(){
-  printf '%s\n' \
-    'tcpfit — NixOS TCP 测量与调优建议工具' \
-    '' \
-    '用法:' \
-    '  tcpfit                               交互式 TUI 菜单（推荐）' \
-    '  tcpfit detect                        输出机器画像并保存结果' \
-    '  tcpfit tune [选项]                   生成基础调优 NixOS 建议，不应用' \
-    '  tcpfit probe --peer HOST             探测可用带宽（临时 qdisc，需要 root）' \
-    '  tcpfit sweep --peer HOST [选项]      实测限速器拐点（临时 qdisc，需要 root）' \
-    '  tcpfit shape --rate N | --off        生成/清除整形建议，不应用' \
-    '  tcpfit harden --swap 2G              生成 swap 建议，不创建 swap' \
-    '  tcpfit verify [--peer HOST]          验证当前状态' \
-    '  tcpfit status                        显示当前配置和已生成建议' \
-    '  tcpfit rollback                      显示手动撤销 NixOS 配置的方法' \
-    '  tcpfit update                        显示 flake 更新方法' \
-    '' \
-    '结果默认保存到 ~/tcpfit；可用 TCPFIT_DIR 覆盖。'
+  local run; run=$(disp)
+  cat <<EOF
+tcpfit — NixOS TCP 测量与调优建议工具
+
+一键运行:
+  $run
+
+子命令:
+  $run detect                        输出机器画像并保存结果
+  $run tune [选项]                   生成基础调优 NixOS 建议，不应用
+  $run probe --peer HOST             探测可用带宽（临时 qdisc，需要 root）
+  $run sweep --peer HOST [选项]      实测限速器拐点（临时 qdisc，需要 root）
+  $run shape --rate N | --off        生成/清除整形建议，不应用
+  $run harden --swap 2G              生成 swap 建议，不创建 swap
+  $run verify [--peer HOST]          验证当前状态
+  $run status                        显示当前配置和已生成建议
+  $run rollback                      显示手动撤销 NixOS 配置的方法
+  $run update                        显示一键脚本更新方法
+
+结果默认保存到 ~/tcpfit；可用 TCPFIT_DIR 覆盖。
+EOF
 }
 
 case "${1:-}" in
